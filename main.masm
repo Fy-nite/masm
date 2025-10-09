@@ -2,4 +2,10 @@ lbl main
     mov RAX 0
     mov RBX 100
     out RAX RBX
+    db $100 "meow\n"
+    call #meow
     hlt
+
+lbl meow
+    out RAX $RBX
+    ret ; lets

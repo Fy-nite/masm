@@ -7,6 +7,8 @@ public struct Disassembler {
         var labelMap: [UInt64: String] // codeOffset -> name
         var code: Data
         var sectionSizes: [String: Int]
+        var dataLabelMap: [UInt64: String] // dataOffset -> name
+        var data: Data
     }
 
     private func readU16LE(_ data: Data, _ offset: inout Int) -> UInt16 {
@@ -71,6 +73,22 @@ public struct Disassembler {
                 codeOffsetToName[addr] = name
             }
         }
+        // Parse local vars as data labels with offsets
+        var dlOff = 0
+        var dataOffsetToName: [UInt64: String] = [:]
+        if localVarTable.count >= 2 {
+            let count = Int(readU16LE(localVarTable, &dlOff))
+            for _ in 0..<count {
+                if dlOff + 2 > localVarTable.count { break }
+                let nameLen = Int(readU16LE(localVarTable, &dlOff))
+                if dlOff + nameLen + 8 > localVarTable.count { break }
+                let nameData = localVarTable.subdata(in: dlOff..<(dlOff+nameLen))
+                dlOff += nameLen
+                let name = String(data: nameData, encoding: .utf8) ?? "data_?"
+                let offs = readU64LE(localVarTable, &dlOff)
+                dataOffsetToName[offs] = name
+            }
+        }
         let sizes = [
             "import": importTable.count,
             "locals": localVarTable.count,
@@ -80,7 +98,7 @@ public struct Disassembler {
             "export": exportTable.count,
             "code": code.count
         ]
-        return MASIFile(version: version, entry: entry, labelMap: codeOffsetToName, code: code, sectionSizes: sizes)
+        return MASIFile(version: version, entry: entry, labelMap: codeOffsetToName, code: code, sectionSizes: sizes, dataLabelMap: dataOffsetToName, data: dataTable)
     }
 
     public func disassemble(_ masi: MASIFile) -> String {
@@ -126,6 +144,23 @@ public struct Disassembler {
                 let d = readOp(); out.append("POP \(fmtOp(d, masi))")
             case 0x40: // OUT
                 let p = readOp(); let v = readOp(); out.append("OUT \(fmtOp(p, masi)) \(fmtOp(v, masi))")
+            case 0x41: // COUT
+                let p = readOp(); let v = readOp(); out.append("COUT \(fmtOp(p, masi)) \(fmtOp(v, masi))")
+            case 0x42: // IN
+                let d = readOp(); out.append("IN \(fmtOp(d, masi))")
+            case 0x50: // ENTER
+                let s = readOp(); out.append("ENTER \(fmtOp(s, masi))")
+            case 0x51: // LEAVE
+                out.append("LEAVE")
+            case 0x60: // MNI
+                let m = readOp(); let f = readOp()
+                var line = "MNI \(fmtOp(m, masi)) \(fmtOp(f, masi))"
+                let argc = Int(readU16LE(code, &pc))
+                for _ in 0..<argc {
+                    let a = readOp()
+                    line += " \(fmtOp(a, masi))"
+                }
+                out.append(line)
             case 0x00:
                 out.append("NOP")
             case 0xFF:
@@ -140,6 +175,7 @@ public struct Disassembler {
     private func fmtOp(_ op: (mode: UInt8, value: UInt64), _ masi: MASIFile) -> String {
         switch op.mode {
         case 0: // immediate
+            if let name = masi.dataLabelMap[op.value] { return "$" + name }
             return String(op.value)
         case 1: // register id => name
             let id = UInt16(truncatingIfNeeded: op.value)
@@ -148,6 +184,13 @@ public struct Disassembler {
         case 2: // label by address (code offset)
             if let name = masi.labelMap[op.value] { return "#\(name)" }
             return String(format: "#0x%llX", op.value)
+        case 3: // memory absolute address
+            if let name = masi.dataLabelMap[op.value] { return "$" + name }
+            return String(format: "$0x%llX", op.value)
+        case 4: // memory via register
+            let id = UInt16(truncatingIfNeeded: op.value)
+            if let name = RegisterMap.name(for: id) { return "$" + name }
+            return "$REG\(id)"
         default:
             return String(op.value)
         }
@@ -161,14 +204,21 @@ public extension Disassembler {
         lines.append("- Version: \(masi.version)")
         lines.append(String(format: "- Entry: 0x%016llX", masi.entry))
         lines.append("- Sections:")
-        for key in ["import","locals","labels","const","data","export","code"] {
+            for key in ["import","locals","labels","const","data","export","code"] {
             if let sz = masi.sectionSizes[key] { lines.append("  - \(key): \(sz) bytes") }
         }
         if !masi.labelMap.isEmpty {
             lines.append("- Labels:")
             for (off, name) in masi.labelMap.sorted(by: { $0.key < $1.key }) {
-                lines.append(String(format: "  - 0x%llX: %s", off, name))
+                lines.append(String(format: "  - 0x%llX: %@", off, name))
             }
+        }
+        if masi.sectionSizes["data"] ?? 0 > 0 {
+            lines.append("- Data labels:")
+            for (off, name) in masi.dataLabelMap.sorted(by: { $0.key < $1.key }) {
+                lines.append(String(format: "  - 0x%llX: %@", off, name))
+            }
+            lines.append("- Data section size: \(masi.sectionSizes["data"]!) bytes")
         }
         return lines.joined(separator: "\n")
     }
