@@ -1,0 +1,22 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:valamasm}",
+            "name": "Debug valamasm",
+            "program": "${workspaceFolder:valamasm}/.build/debug/valamasm",
+            "preLaunchTask": "swift: Build Debug valamasm"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:valamasm}",
+            "name": "Release valamasm",
+            "program": "${workspaceFolder:valamasm}/.build/release/valamasm",
+            "preLaunchTask": "swift: Build Release valamasm"
+        }
+    ]
+}
