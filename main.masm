@@ -1,5 +1,5 @@
 lbl main
-    mov RAX 1
+    mov RAX 0
     mov RBX 100
     out RAX RBX
     hlt
