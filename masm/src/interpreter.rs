@@ -52,7 +52,9 @@ pub struct ModuleRegistry {
 impl ModuleRegistry {
     pub fn new() -> Self { Self { funcs: HashMap::new() } }
     pub fn register<F: Fn(&mut MniCtx) + 'static>(&mut self, module: &str, name: &str, f: F) {
-        self.funcs.entry(module.to_string()).or_default().insert(name.to_string(), Box::new(f));
+        let module_key = module.trim().to_lowercase();
+        let name_key = name.trim().to_lowercase();
+        self.funcs.entry(module_key).or_default().insert(name_key, Box::new(f));
     }
     pub fn lookup(&self, module: &str, name: &str) -> Option<&MniFunc> { self.funcs.get(module)?.get(name) }
 }
@@ -142,7 +144,7 @@ fn load_lua_modules(registry: &mut ModuleRegistry) -> Result<(), String> {
             };
             if let (Some(mod_name), Some(funcs)) = (module_name, funcs_table) {
                 for pair in funcs.pairs::<String, LuaFunction>() {
-                    let (fname, _func) = pair.map_err(|e| e.to_string())?;
+                    let (fname, lf) = pair.map_err(|e| e.to_string())?;
                     // Only register if not already present
                     let already = registry.lookup(&mod_name, &fname).is_some();
                     if already {
@@ -150,43 +152,36 @@ fn load_lua_modules(registry: &mut ModuleRegistry) -> Result<(), String> {
                         continue;
                     }
                     println!("[Lua MNI] Registering {}.{}", mod_name, fname);
-                    let lua = Lua::new();
-                    let chunk2 = lua.load(&src);
-                    let _ = chunk2.eval::<LuaValue>();
-                    let globals2 = lua.globals();
-                    let funcs2: Option<LuaTable> = globals2.get("MNI_FUNCTIONS").ok();
-                    let lua_func: Option<LuaFunction> = if let Some(ft) = funcs2 { ft.get(fname.as_str()).ok() } else { None };
-                    if let Some(lf) = lua_func {
-                        registry.register(&mod_name, &fname, move |ctx: &mut MniCtx| {
-                            let args_arr = lua.create_table().unwrap();
-                            for (i, a) in ctx.args.iter().enumerate() { let _ = args_arr.set((i+1) as i64, a.as_str()); }
-                            let regs_tbl = lua.create_table().unwrap();
-                            for (id, val) in ctx.state.regs.iter() {
-                                if let Some(name) = RegisterMap::build_id_to_name().get(id) { let _ = regs_tbl.set(name.as_str(), *val as i64); }
-                            }
-                            let ret: mlua::Result<LuaValue> = lf.call((args_arr, regs_tbl));
-                            if let Ok(val) = ret {
-                                match val {
-                                    LuaValue::Nil => {}
-                                    LuaValue::String(s) => { if let Ok(st) = s.to_str() { println!("{}", st); } }
-                                    LuaValue::Table(t) => {
-                                        if let Ok(Some(out)) = t.get::<Option<String>>("out") { println!("{}", out); }
-                                        if let Ok(Some(upd)) = t.get::<Option<LuaTable>>("regs") {
-                                            for pair in upd.pairs::<String, i64>() { if let Ok((rname, ival)) = pair { if let Some(id) = RegisterMap::build_name_to_id().get(&rname) { ctx.state.regs.insert(*id, ival as u64); } } }
-                                        }
-                                        if let Ok(Some(store)) = t.get::<Option<LuaTable>>("store") {
-                                            let mut dest: Option<u64> = None;
-                                            if let Ok(Some(addr)) = store.get::<Option<u64>>("addr") { dest = Some(addr); }
-                                            else if let Ok(Some(rname)) = store.get::<Option<String>>("reg") { if let Some(id) = RegisterMap::build_name_to_id().get(&rname) { dest = Some(*ctx.state.regs.get(id).unwrap_or(&0)); } }
-                                            if let Some(base) = dest { let base_usize = base as usize; if let Ok(Some(s)) = store.get::<Option<String>>("string") { let mut bytes = s.into_bytes(); bytes.push(0); if ctx.state.memory.len() < base_usize + bytes.len() { ctx.state.memory.resize(base_usize + bytes.len(), 0); } ctx.state.memory[base_usize..base_usize+bytes.len()].copy_from_slice(&bytes); }
-                                            else if let Ok(Some(arr)) = store.get::<Option<LuaTable>>("bytes") { let len = arr.len().unwrap_or(0) as usize; let mut bytes: Vec<u8> = Vec::with_capacity(len); for i in 1..=len { if let Ok(v) = arr.get::<i64>(i as i64) { bytes.push(v as u8); } } if ctx.state.memory.len() < base_usize + bytes.len() { ctx.state.memory.resize(base_usize + bytes.len(), 0); } ctx.state.memory[base_usize..base_usize+bytes.len()].copy_from_slice(&bytes); } }
-                                        }
+                    let lua_ref = lua.clone();
+                    registry.register(&mod_name, &fname, move |ctx: &mut MniCtx| {
+                        let args_arr = lua_ref.create_table().unwrap();
+                        for (i, a) in ctx.args.iter().enumerate() { let _ = args_arr.set((i+1) as i64, a.as_str()); }
+                        let regs_tbl = lua_ref.create_table().unwrap();
+                        for (id, val) in ctx.state.regs.iter() {
+                            if let Some(name) = RegisterMap::build_id_to_name().get(id) { let _ = regs_tbl.set(name.as_str(), *val as i64); }
+                        }
+                        let ret: mlua::Result<LuaValue> = lf.call((args_arr, regs_tbl));
+                        if let Ok(val) = ret {
+                            match val {
+                                LuaValue::Nil => {}
+                                LuaValue::String(s) => { if let Ok(st) = s.to_str() { println!("{}", st); } }
+                                LuaValue::Table(t) => {
+                                    if let Ok(Some(out)) = t.get::<Option<String>>("out") { println!("{}", out); }
+                                    if let Ok(Some(upd)) = t.get::<Option<LuaTable>>("regs") {
+                                        for pair in upd.pairs::<String, i64>() { if let Ok((rname, ival)) = pair { if let Some(id) = RegisterMap::build_name_to_id().get(&rname) { ctx.state.regs.insert(*id, ival as u64); } } }
                                     }
-                                    _ => {}
+                                    if let Ok(Some(store)) = t.get::<Option<LuaTable>>("store") {
+                                        let mut dest: Option<u64> = None;
+                                        if let Ok(Some(addr)) = store.get::<Option<u64>>("addr") { dest = Some(addr); }
+                                        else if let Ok(Some(rname)) = store.get::<Option<String>>("reg") { if let Some(id) = RegisterMap::build_name_to_id().get(&rname) { dest = Some(*ctx.state.regs.get(id).unwrap_or(&0)); } }
+                                        if let Some(base) = dest { let base_usize = base as usize; if let Ok(Some(s)) = store.get::<Option<String>>("string") { let mut bytes = s.into_bytes(); bytes.push(0); if ctx.state.memory.len() < base_usize + bytes.len() { ctx.state.memory.resize(base_usize + bytes.len(), 0); } ctx.state.memory[base_usize..base_usize+bytes.len()].copy_from_slice(&bytes); }
+                                        else if let Ok(Some(arr)) = store.get::<Option<LuaTable>>("bytes") { let len = arr.len().unwrap_or(0) as usize; let mut bytes: Vec<u8> = Vec::with_capacity(len); for i in 1..=len { if let Ok(v) = arr.get::<i64>(i as i64) { bytes.push(v as u8); } } if ctx.state.memory.len() < base_usize + bytes.len() { ctx.state.memory.resize(base_usize + bytes.len(), 0); } ctx.state.memory[base_usize..base_usize+bytes.len()].copy_from_slice(&bytes); } }
+                                    }
                                 }
+                                _ => {}
                             }
-                        });
-                    }
+                        }
+                    });
                 }
             }
         }
@@ -298,7 +293,7 @@ pub fn run_masi(masi: &MASIFile) -> Result<(), String> {
                 println!("[DEBUG] Registered MNI functions:");
                 for (modn, fmap) in &registry.funcs {
                     for fname in fmap.keys() {
-                        println!("  {:?}.{:?}", modn, fname);
+                        println!("  [{}].[{}]", modn, fname);
                     }
                 }
                 if let (Some(mn), Some(fn_)) = (mod_name, fn_name) {
