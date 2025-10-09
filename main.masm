@@ -8,4 +8,6 @@ lbl main
 
 lbl meow
     out RAX $RBX
+    mni tool.set_rax 5
+    out 1 RAX
     ret ; lets

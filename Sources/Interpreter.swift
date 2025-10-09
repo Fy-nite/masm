@@ -390,7 +390,7 @@ public final class Interpreter {
     // Load external modules from ./modules
     let cwd = FileManager.default.currentDirectoryPath
     let modulesDir = (cwd as NSString).appendingPathComponent("modules")
-    loadModules(from: modulesDir)
+    // loadModules(from: modulesDir)
     var pc = Int(truncatingIfNeeded: masi.entry)
         let code = masi.code
         while pc < code.count {

@@ -1,4 +1,6 @@
 import Foundation
+// Set the PYTHON_LIBRARY environment variable with the path to the local python library based on os
+
 
 struct ParsedArguments {
     var showHelp: Bool = false
@@ -14,6 +16,7 @@ struct ParsedArguments {
 
 func parseArguments(_ args: ArraySlice<String>) -> ParsedArguments {
     var result: ParsedArguments = ParsedArguments()
+    
     var iterator = args.makeIterator()
     while let arg: String = iterator.next() {
         switch arg {
@@ -89,7 +92,7 @@ class Program {
             Instructions.printUsage()
             return
         }
-
+        
         // If we reach here, we have a valid masm file to process
         if let file: String = parsed.masmFile {
             do {
@@ -142,5 +145,6 @@ class Program {
         
     }
 }
+
 
 Program.main()
