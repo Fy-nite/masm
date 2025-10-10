@@ -197,9 +197,10 @@ extern "C" fn host_get_reg_by_name(ctx: *mut MniVmCtx, name: *const c_char) -> u
     unsafe {
         if ctx.is_null() || name.is_null() { return 0; }
         let s = &mut *( (*ctx).user_data as *mut State );
-        let nm = match CStr::from_ptr(name).to_str() { Ok(v) => v, Err(_) => return 0 };
-        let idmap = RegisterMap::build_name_to_id();
-        if let Some(id) = idmap.get(nm) { *s.regs.get(id).unwrap_or(&0) } else { 0 }
+    let nm = match CStr::from_ptr(name).to_str() { Ok(v) => v, Err(_) => return 0 };
+    let nm_up = nm.to_uppercase();
+    let idmap = RegisterMap::build_name_to_id();
+    if let Some(id) = idmap.get(nm_up.as_str()) { *s.regs.get(id).unwrap_or(&0) } else { 0 }
     }
 }
 
@@ -207,9 +208,10 @@ extern "C" fn host_set_reg_by_name(ctx: *mut MniVmCtx, name: *const c_char, valu
     unsafe {
         if ctx.is_null() || name.is_null() { return; }
         let s = &mut *( (*ctx).user_data as *mut State );
-        let nm = match CStr::from_ptr(name).to_str() { Ok(v) => v, Err(_) => return };
-        let idmap = RegisterMap::build_name_to_id();
-        if let Some(id) = idmap.get(nm) { s.regs.insert(*id, value); }
+    let nm = match CStr::from_ptr(name).to_str() { Ok(v) => v, Err(_) => return };
+    let nm_up = nm.to_uppercase();
+    let idmap = RegisterMap::build_name_to_id();
+    if let Some(id) = idmap.get(nm_up.as_str()) { s.regs.insert(*id, value); }
     }
 }
 
