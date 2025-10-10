@@ -9,5 +9,6 @@ lbl main
 lbl meow
     out RAX $RBX
     mni tool.set_rax 5
+    MNI MyLib.my_func "hello_from_masm"
     out 1 RAX
     ret ; lets

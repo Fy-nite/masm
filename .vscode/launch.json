@@ -35,6 +35,24 @@
             "name": "Release masm",
             "program": "${workspaceFolder:valamasm}/.build/release/masm",
             "preLaunchTask": "swift: Build Release masm"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:valamasm}/swift",
+            "name": "Debug masm (swift)",
+            "program": "${workspaceFolder:valamasm}/swift/.build/debug/masm",
+            "preLaunchTask": "swift: Build Debug masm (swift)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:valamasm}/swift",
+            "name": "Release masm (swift)",
+            "program": "${workspaceFolder:valamasm}/swift/.build/release/masm",
+            "preLaunchTask": "swift: Build Release masm (swift)"
         }
     ]
 }

@@ -21,6 +21,9 @@ use std::io::{self, Write, BufRead};
 use std::fs;
 use std::path::Path;
 use mlua::{Lua, Value as LuaValue, Table as LuaTable, Function as LuaFunction};
+use std::ffi::{CString, CStr};
+use std::os::raw::{c_char, c_void};
+use libloading::Library;
 
 #[repr(u8)]
 enum Op {
@@ -84,16 +87,61 @@ type MniFunc = Box<dyn Fn(&mut MniCtx) + 'static>;
 
 pub struct ModuleRegistry {
     funcs: HashMap<String, HashMap<String, MniFunc>>,
+    dyn_libs: HashMap<String, Library>,
 }
 
 impl ModuleRegistry {
-    pub fn new() -> Self { Self { funcs: HashMap::new() } }
+    pub fn new() -> Self { Self { funcs: HashMap::new(), dyn_libs: HashMap::new() } }
     pub fn register<F: Fn(&mut MniCtx) + 'static>(&mut self, module: &str, name: &str, f: F) {
         let module_key = module.trim().to_lowercase();
         let name_key = name.trim().to_lowercase();
         self.funcs.entry(module_key).or_default().insert(name_key, Box::new(f));
     }
     pub fn lookup(&self, module: &str, name: &str) -> Option<&MniFunc> { self.funcs.get(module)?.get(name) }
+
+    fn build_candidate_lib_names(module: &str) -> Vec<String> {
+        let mut cands: Vec<String> = Vec::new();
+        let base = module.to_string();
+        if cfg!(windows) {
+            cands.push(format!("{}.dll", base));
+            cands.push(format!("lib{}.dll", base));
+        } else if cfg!(target_os = "macos") {
+            cands.push(format!("lib{}.dylib", base));
+            cands.push(format!("{}.dylib", base));
+        } else {
+            cands.push(format!("lib{}.so", base));
+            cands.push(format!("{}.so", base));
+        }
+        cands
+    }
+
+    fn build_search_dirs() -> Vec<std::path::PathBuf> {
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(cwd) = std::env::current_dir() { dirs.push(cwd); }
+        dirs.push(std::path::PathBuf::from("modules"));
+        if let Ok(exe) = std::env::current_exe() { if let Some(p) = exe.parent() { dirs.push(p.to_path_buf()); } }
+        dirs
+    }
+
+    fn load_dyn_lib(&mut self, module_name_raw: &str) -> Result<&Library, String> {
+        let key = module_name_raw.to_string();
+        if self.dyn_libs.contains_key(&key) { return Ok(self.dyn_libs.get(&key).unwrap()); }
+        let mut last_err: Option<String> = None;
+        let dirs = Self::build_search_dirs();
+        let names = Self::build_candidate_lib_names(module_name_raw);
+        for d in dirs.iter() {
+            for n in names.iter() {
+                let path = d.join(n);
+                if path.exists() {
+                    match unsafe { Library::new(&path) } {
+                        Ok(lib) => { self.dyn_libs.insert(key.clone(), lib); return Ok(self.dyn_libs.get(&key).unwrap()); }
+                        Err(e) => { last_err = Some(format!("failed to load {}: {}", path.display(), e)); }
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| format!("dynamic module '{}' not found", module_name_raw)))
+    }
 }
 
 fn read_u16_le(data: &[u8], off: &mut usize) -> u16 { let mut v=0u16; v |= data[*off] as u16; v |= (data[*off+1] as u16) << 8; *off+=2; v }
@@ -110,6 +158,59 @@ fn write_u64_to_memory(addr: u64, value: u64, state: &mut State) {
     let a = addr as usize; if a > usize::MAX - 8 { return; }
     if state.memory.len() < a + 8 { state.memory.resize(a + 8, 0); }
     let mut v = value; for i in 0..8 { state.memory[a+i] = (v & 0xFF) as u8; v >>= 8; }
+}
+
+// -------- MNI C-ABI host context (optional, for native libraries) --------
+#[repr(C)]
+pub struct MniVmCtx {
+    pub api_version: u32,
+    pub user_data: *mut c_void, // internal: points to State
+    pub memory_ptr: *mut u8,
+    pub memory_len: usize,
+    // host ops
+    pub read_u64: extern "C" fn(*mut MniVmCtx, u64) -> u64,
+    pub write_u64: extern "C" fn(*mut MniVmCtx, u64, u64),
+    pub get_reg_by_name: extern "C" fn(*mut MniVmCtx, *const c_char) -> u64,
+    pub set_reg_by_name: extern "C" fn(*mut MniVmCtx, *const c_char, u64),
+}
+
+extern "C" fn host_read_u64(ctx: *mut MniVmCtx, addr: u64) -> u64 {
+    unsafe {
+        if ctx.is_null() { return 0; }
+        let s = &mut *( (*ctx).user_data as *mut State );
+        read_u64_from_memory(addr, s)
+    }
+}
+
+extern "C" fn host_write_u64(ctx: *mut MniVmCtx, addr: u64, value: u64) {
+    unsafe {
+        if ctx.is_null() { return; }
+        let s = &mut *( (*ctx).user_data as *mut State );
+        write_u64_to_memory(addr, value, s);
+        // update pointers after potential resize
+        (*ctx).memory_ptr = s.memory.as_mut_ptr();
+        (*ctx).memory_len = s.memory.len();
+    }
+}
+
+extern "C" fn host_get_reg_by_name(ctx: *mut MniVmCtx, name: *const c_char) -> u64 {
+    unsafe {
+        if ctx.is_null() || name.is_null() { return 0; }
+        let s = &mut *( (*ctx).user_data as *mut State );
+        let nm = match CStr::from_ptr(name).to_str() { Ok(v) => v, Err(_) => return 0 };
+        let idmap = RegisterMap::build_name_to_id();
+        if let Some(id) = idmap.get(nm) { *s.regs.get(id).unwrap_or(&0) } else { 0 }
+    }
+}
+
+extern "C" fn host_set_reg_by_name(ctx: *mut MniVmCtx, name: *const c_char, value: u64) {
+    unsafe {
+        if ctx.is_null() || name.is_null() { return; }
+        let s = &mut *( (*ctx).user_data as *mut State );
+        let nm = match CStr::from_ptr(name).to_str() { Ok(v) => v, Err(_) => return };
+        let idmap = RegisterMap::build_name_to_id();
+        if let Some(id) = idmap.get(nm) { s.regs.insert(*id, value); }
+    }
 }
 
 fn get_operand(code: &[u8], pc: &mut usize, state: &mut State) -> u64 {
@@ -498,9 +599,83 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
                         let rax_val = state.regs.get(&rax_id).copied().unwrap_or(0);
                         debug_println!("[DEBUG] RAX after MNI: {}", rax_val);
                     } else {
-                        let msg = format!("MNI: function not found: {}.{}", mn, fn_);
-                        state.errors.push(msg.clone());
-                        return Err(msg);
+                        // Try dynamic library loading via libloading
+                        let module_raw = mn.trim();
+                        let func_raw = fn_.trim();
+                        match registry.load_dyn_lib(module_raw) {
+                            Ok(lib) => {
+                                unsafe {
+                                    // Try exact symbol, then with mni_ prefix, try lowercased variants
+                                    let mut sym_err: Option<String> = None;
+                                    let mut call_res: Option<i64> = None;
+                                    type MniC = unsafe extern "C" fn(argc: i32, argv: *const *const c_char) -> i64;
+                                    type MniCWithCtx = unsafe extern "C" fn(ctx: *mut MniVmCtx, argc: i32, argv: *const *const c_char) -> i64;
+                                    let try_symbol = |name: &str| -> Result<MniC, String> {
+                                        match lib.get::<MniC>(name.as_bytes()) { Ok(sym) => Ok(*sym), Err(e) => Err(e.to_string()) }
+                                    };
+                                    let try_symbol_ctx = |name: &str| -> Result<MniCWithCtx, String> {
+                                        match lib.get::<MniCWithCtx>(name.as_bytes()) { Ok(sym) => Ok(*sym), Err(e) => Err(e.to_string()) }
+                                    };
+                                    let candidates = vec![
+                                        func_raw.to_string(),
+                                        format!("mni_{}", func_raw),
+                                        func_raw.to_lowercase(),
+                                        format!("mni_{}", func_raw.to_lowercase()),
+                                    ];
+                                    // Build argv once
+                                    let c_args: Vec<CString> = argv.iter().map(|s| CString::new(s.as_str()).unwrap_or_else(|_| CString::new("\u{0}").unwrap())).collect();
+                                    let mut ptrs: Vec<*const c_char> = c_args.iter().map(|s| s.as_ptr()).collect();
+                                    ptrs.push(std::ptr::null());
+                                    // Prepare VM context
+                                    let mut vm_ctx = MniVmCtx {
+                                        api_version: 1,
+                                        user_data: (&mut state as *mut State).cast(),
+                                        memory_ptr: state.memory.as_mut_ptr(),
+                                        memory_len: state.memory.len(),
+                                        read_u64: host_read_u64,
+                                        write_u64: host_write_u64,
+                                        get_reg_by_name: host_get_reg_by_name,
+                                        set_reg_by_name: host_set_reg_by_name,
+                                    };
+                                    for cname in candidates.iter() {
+                                        // Prefer ctx variant first ("name_ctx")
+                                        let ctx_variants = [format!("{}_ctx", cname), format!("{}_CTX", cname)];
+                                        let mut used = false;
+                                        for v in ctx_variants.iter() {
+                                            if let Ok(fctx) = try_symbol_ctx(v) {
+                                                let ret = fctx(&mut vm_ctx as *mut MniVmCtx, c_args.len() as i32, ptrs.as_ptr());
+                                                call_res = Some(ret); used = true; break;
+                                            }
+                                        }
+                                        if used { break; }
+                                        match try_symbol(cname) {
+                                            Ok(f) => {
+                                                let ret = f(c_args.len() as i32, ptrs.as_ptr());
+                                                call_res = Some(ret);
+                                                break;
+                                            }
+                                            Err(e) => { sym_err = Some(e); }
+                                        }
+                                    }
+                                    if let Some(val) = call_res {
+                                        // Place return value into RAX
+                                        let rax_id = RegisterMap::build_name_to_id().get("RAX").copied().unwrap_or(0);
+                                        state.regs.insert(rax_id, val as u64);
+                                        // sync memory pointer/len in case C mutated memory via ctx
+                                        // (state already updated by host_write_u64 when called)
+                                    } else {
+                                        let msg = format!("MNI: dynamic function not found in module '{}': {} (last error: {:?})", module_raw, func_raw, sym_err);
+                                        state.errors.push(msg.clone());
+                                        return Err(msg);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let msg = format!("MNI: function not found: {}.{} (dynamic load error: {})", mn, fn_, e);
+                                state.errors.push(msg.clone());
+                                return Err(msg);
+                            }
+                        }
                     }
                 } else {
                     let msg = "MNI: module or function decoding failed".to_string();

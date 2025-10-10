@@ -43,10 +43,10 @@ fn main() {
 
     let Some(input_path) = input else { print_usage(); return; };
     if input_path.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("masi")).unwrap_or(false) {
-        // Disassemble or dump
+        // Run, disassemble, or dump
         let path_str = input_path.to_string_lossy();
         let masi = match disassembler::load(&path_str) { Ok(m) => m, Err(e) => { eprintln!("Failed to load MASI: {}", e); return; } };
-        if run_flag {
+        if run_flag || (!disasm && !dump) {
             if let Err(e) = interpreter::run_masi(&masi) { eprintln!("Run failed: {}", e); }
             return;
         }
@@ -60,8 +60,7 @@ fn main() {
             else { println!("{}", asm); }
             return;
         }
-        eprintln!("Input is .masi but no --disasm/--dump provided");
-        return;
+        // unreachable: covered above
     } else {
         // Assemble
         let out_path = output.unwrap_or_else(|| PathBuf::from("out.masi"));
