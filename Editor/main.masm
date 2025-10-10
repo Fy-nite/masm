@@ -1,0 +1,5 @@
+lbl main
+mov RAX 1
+hw: db "hello worlds\n"
+out RAX $hw
+hlt
