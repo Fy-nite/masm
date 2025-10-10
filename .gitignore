@@ -11,3 +11,8 @@ DerivedData/
 *.masi
 target/
 build
+*.dll
+*.exe
+*.log
+*.tmp
+*.swp
