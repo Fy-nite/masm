@@ -10,3 +10,4 @@ DerivedData/
 .masi
 *.masi
 target/
+build

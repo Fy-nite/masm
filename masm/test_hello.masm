@@ -1,0 +1,50 @@
+; Generated Micro-Assembly code from Fortran
+; Compiled with micro-fortran compiler
+
+LBL main
+
+; Variable x at address 1000
+MOV $1000 0
+; Variable y at address 1008
+MOV $1008 0
+; Variable sum at address 1016
+MOV $1016 0
+; Main program
+; Assignment: x = expression
+MOV R1 10
+MOV $1000 R1
+; Assignment: y = expression
+MOV R1 5
+MOV $1008 R1
+; Assignment: sum = expression
+MOV R1 $1000
+MOV R2 $1008
+MOV R3 R1
+ADD R3 R2
+MOV $1016 R3
+; PRINT statement
+DB $1024 "Hello from Fortran!\n"
+OUT 1 $1024
+; PRINT statement
+DB $1046 "Sum is:"
+OUT 1 $1046
+MOV R3 $1016
+OUT 1 R3
+; IF statement
+MOV R3 $1016
+MOV R2 25
+CMP R3 R2
+JEQ #label_1
+JL #label_1
+; PRINT statement
+DB $1054 "Sum is greater than 25"
+OUT 1 $1054
+JMP #label_2
+LBL label_1
+; PRINT statement
+DB $1077 "Sum is not greater than 25"
+OUT 1 $1077
+LBL label_2
+; STOP statement
+HLT
+HLT

@@ -116,10 +116,27 @@ pub fn disassemble(masi: &MASIFile) -> String {
             0x01 => { let d=read_op(&mut pc); let s=read_op(&mut pc); out.push(format!("MOV {} {}", fmt_op(d.0,d.1,masi,&reg_rev), fmt_op(s.0,s.1,masi,&reg_rev))); }
             0x02 => { let d=read_op(&mut pc); let s=read_op(&mut pc); out.push(format!("ADD {} {}", fmt_op(d.0,d.1,masi,&reg_rev), fmt_op(s.0,s.1,masi,&reg_rev))); }
             0x03 => { let d=read_op(&mut pc); let s=read_op(&mut pc); out.push(format!("SUB {} {}", fmt_op(d.0,d.1,masi,&reg_rev), fmt_op(s.0,s.1,masi,&reg_rev))); }
+            0x70 => { let d=read_op(&mut pc); let s=read_op(&mut pc); out.push(format!("FMOV {} {}", fmt_op(d.0,d.1,masi,&reg_rev), fmt_op(s.0,s.1,masi,&reg_rev))); }
+            0x71 => { let d=read_op(&mut pc); let s=read_op(&mut pc); out.push(format!("FADD {} {}", fmt_op(d.0,d.1,masi,&reg_rev), fmt_op(s.0,s.1,masi,&reg_rev))); }
+            0x72 => { let d=read_op(&mut pc); let s=read_op(&mut pc); out.push(format!("FSUB {} {}", fmt_op(d.0,d.1,masi,&reg_rev), fmt_op(s.0,s.1,masi,&reg_rev))); }
+            0x73 => { let d=read_op(&mut pc); let s=read_op(&mut pc); out.push(format!("FMUL {} {}", fmt_op(d.0,d.1,masi,&reg_rev), fmt_op(s.0,s.1,masi,&reg_rev))); }
+            0x74 => { let d=read_op(&mut pc); let s=read_op(&mut pc); out.push(format!("FDIV {} {}", fmt_op(d.0,d.1,masi,&reg_rev), fmt_op(s.0,s.1,masi,&reg_rev))); }
+            0x75 => { let a=read_op(&mut pc); let b=read_op(&mut pc); out.push(format!("FCMP {} {}", fmt_op(a.0,a.1,masi,&reg_rev), fmt_op(b.0,b.1,masi,&reg_rev))); }
+            0x76 => { let t=read_op(&mut pc); out.push(format!("FJE {}", fmt_op(t.0,t.1,masi,&reg_rev))); }
+            0x77 => { let t=read_op(&mut pc); out.push(format!("FJNE {}", fmt_op(t.0,t.1,masi,&reg_rev))); }
+            0x78 => { let t=read_op(&mut pc); out.push(format!("FJLT {}", fmt_op(t.0,t.1,masi,&reg_rev))); }
+            0x79 => { let t=read_op(&mut pc); out.push(format!("FJLE {}", fmt_op(t.0,t.1,masi,&reg_rev))); }
+            0x7A => { let t=read_op(&mut pc); out.push(format!("FJGT {}", fmt_op(t.0,t.1,masi,&reg_rev))); }
+            0x7B => { let t=read_op(&mut pc); out.push(format!("FJGE {}", fmt_op(t.0,t.1,masi,&reg_rev))); }
+            0x7C => { let t=read_op(&mut pc); out.push(format!("FJUO {}", fmt_op(t.0,t.1,masi,&reg_rev))); }
             0x10 => { let t=read_op(&mut pc); out.push(format!("JMP {}", fmt_op(t.0,t.1,masi,&reg_rev))); }
             0x11 => { let a=read_op(&mut pc); let b=read_op(&mut pc); out.push(format!("CMP {} {}", fmt_op(a.0,a.1,masi,&reg_rev), fmt_op(b.0,b.1,masi,&reg_rev))); }
             0x12 => { let t=read_op(&mut pc); out.push(format!("JE {}", fmt_op(t.0,t.1,masi,&reg_rev))); }
             0x13 => { let t=read_op(&mut pc); out.push(format!("JNE {}", fmt_op(t.0,t.1,masi,&reg_rev))); }
+            0x14 => { let t=read_op(&mut pc); out.push(format!("JL {}", fmt_op(t.0,t.1,masi,&reg_rev))); }
+            0x15 => { let t=read_op(&mut pc); out.push(format!("JLE {}", fmt_op(t.0,t.1,masi,&reg_rev))); }
+            0x16 => { let t=read_op(&mut pc); out.push(format!("JG {}", fmt_op(t.0,t.1,masi,&reg_rev))); }
+            0x17 => { let t=read_op(&mut pc); out.push(format!("JGE {}", fmt_op(t.0,t.1,masi,&reg_rev))); }
             0x20 => { let t=read_op(&mut pc); out.push(format!("CALL {}", fmt_op(t.0,t.1,masi,&reg_rev))); }
             0x21 => { out.push("RET".into()); }
             0x30 => { let v=read_op(&mut pc); out.push(format!("PUSH {}", fmt_op(v.0,v.1,masi,&reg_rev))); }

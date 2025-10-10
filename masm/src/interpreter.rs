@@ -1,7 +1,23 @@
+// Debug printing macro, controlled by DEBUG_PRINT flag
+#[allow(unused_macros)]
+macro_rules! debug_println {
+    ($($arg:tt)*) => {
+        if cfg!(feature = "debug_print") || DEBUG_PRINT.load(std::sync::atomic::Ordering::Relaxed) {
+            println!($($arg)*);
+        }
+    };
+}
+
+use std::sync::atomic::{AtomicBool, Ordering};
+static DEBUG_PRINT: AtomicBool = AtomicBool::new(false);
+
+pub fn set_debug_print(enabled: bool) {
+    DEBUG_PRINT.store(enabled, Ordering::Relaxed);
+}
 use crate::disassembler::{self, MASIFile};
 use crate::register_map::RegisterMap;
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, Write, BufRead};
 use std::fs;
 use std::path::Path;
 use mlua::{Lua, Value as LuaValue, Table as LuaTable, Function as LuaFunction};
@@ -15,6 +31,10 @@ enum Op {
     Cmp = 0x11,
     Je  = 0x12,
     Jne = 0x13,
+    Jl  = 0x14,
+    Jle = 0x15,
+    Jg  = 0x16,
+    Jge = 0x17,
     Call = 0x20,
     Ret  = 0x21,
     Push = 0x30,
@@ -25,6 +45,21 @@ enum Op {
     Enter= 0x50,
     Leave= 0x51,
     Mni  = 0x60,
+    Syscall = 0x90,
+    // Floating point
+    FMov = 0x70,
+    FAdd = 0x71,
+    FSub = 0x72,
+    FMul = 0x73,
+    FDiv = 0x74,
+    FCmp = 0x75,
+    FJe  = 0x76,
+    FJne = 0x77,
+    FJlt = 0x78,
+    FJle = 0x79,
+    FJgt = 0x7A,
+    FJge = 0x7B,
+    FJuo = 0x7C,
     Hlt  = 0xFF,
     Nop  = 0x00,
 }
@@ -36,6 +71,8 @@ pub struct State {
     pub rip: u64,
     pub stack: Vec<u64>,
     pub memory: Vec<u8>,
+    pub warnings: Vec<String>,
+    pub errors: Vec<String>,
 }
 
 pub struct MniCtx {
@@ -64,7 +101,9 @@ fn read_u64_le(data: &[u8], off: &mut usize) -> u64 { let mut v=0u64; for i in 0
 
 fn read_u64_from_memory(addr: u64, state: &State) -> u64 {
     let a = addr as usize;
-    if a + 8 > state.memory.len() { return 0; }
+    if a >= state.memory.len() { return 0; }
+    let end = a.saturating_add(8);
+    if end > state.memory.len() { return 0; }
     let mut v = 0u64; for i in 0..8 { v |= (state.memory[a+i] as u64) << (8*i); } v
 }
 fn write_u64_to_memory(addr: u64, value: u64, state: &mut State) {
@@ -79,8 +118,20 @@ fn get_operand(code: &[u8], pc: &mut usize, state: &mut State) -> u64 {
         0 => val,
         1 => { let id = val as u16; *state.regs.get(&id).unwrap_or(&0) },
         2 => val,
-        3 => read_u64_from_memory(val, state),
-        4 => { let id = val as u16; let addr = *state.regs.get(&id).unwrap_or(&0); read_u64_from_memory(addr, state) },
+        3 => {
+            let a = val as usize;
+            if a >= state.memory.len() || a.saturating_add(8) > state.memory.len() {
+                state.warnings.push(format!("read_u64 OOB at 0x{:X} (mem size {})", a, state.memory.len()));
+            }
+            read_u64_from_memory(val, state)
+        }
+        4 => {
+            let id = val as u16; let addr = *state.regs.get(&id).unwrap_or(&0); let a = addr as usize;
+            if a >= state.memory.len() || a.saturating_add(8) > state.memory.len() {
+                state.warnings.push(format!("read_u64 OOB at 0x{:X} (mem size {})", a, state.memory.len()));
+            }
+            read_u64_from_memory(addr, state)
+        },
         _ => val,
     }
 }
@@ -148,10 +199,10 @@ fn load_lua_modules(registry: &mut ModuleRegistry) -> Result<(), String> {
                     // Only register if not already present
                     let already = registry.lookup(&mod_name, &fname).is_some();
                     if already {
-                        println!("[Lua MNI] Skipping already-registered {}.{}", mod_name, fname);
+                        debug_println!("[Lua MNI] Skipping already-registered {}.{}", mod_name, fname);
                         continue;
                     }
-                    println!("[Lua MNI] Registering {}.{}", mod_name, fname);
+                    debug_println!("[Lua MNI] Registering {}.{}", mod_name, fname);
                     let lua_ref = lua.clone();
                     registry.register(&mod_name, &fname, move |ctx: &mut MniCtx| {
                         let args_arr = lua_ref.create_table().unwrap();
@@ -195,6 +246,25 @@ pub fn run_path(path: &str) -> Result<(), String> {
 }
 
 pub fn run_masi(masi: &MASIFile) -> Result<(), String> {
+    // Default runner using real stdio; discards final state
+    let mut out = io::stdout();
+    let mut err = io::stderr();
+    let mut stdin_lock = io::stdin().lock();
+    let _state = run_masi_with_io(masi, &mut out, &mut err, Some(&mut stdin_lock))?;
+    Ok(())
+}
+
+/// Run a MASI file with injectable IO and return final VM state for testing.
+///
+/// - out: where OUT/COUT to port 1 prints go (newline semantics preserved)
+/// - err: where OUT/COUT to port 2 prints go
+/// - input: optional buffered reader used by IN; if None, reads from stdin
+pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
+    masi: &MASIFile,
+    out: &mut WO,
+    err: &mut WE,
+    mut input: Option<&mut R>,
+) -> Result<State, String> {
     let mut state = State::default();
     state.memory = masi.data.clone();
     let mut registry = ModuleRegistry::new();
@@ -214,6 +284,43 @@ pub fn run_masi(masi: &MASIFile) -> Result<(), String> {
     // //     }
     // // });
 
+    // Built-in Rust MNI shims
+    {
+        // tool.set_rax already exists via Lua examples, but provide a basic Rust one if not provided by Lua
+        let nm = RegisterMap::build_name_to_id();
+        let rax = *nm.get("RAX").unwrap_or(&0);
+        registry.register("tool", "set_rax", move |ctx: &mut MniCtx| {
+            if let Some(first) = ctx.args.get(0) {
+                if let Ok(v) = first.parse::<i64>() { ctx.state.regs.insert(rax, v as u64); }
+            }
+        });
+        // Memory.allocate size -> R1
+        let r1 = *nm.get("R1").unwrap_or(&0);
+        registry.register("Memory", "allocate", move |ctx: &mut MniCtx| {
+            if let Some(sz_s) = ctx.args.get(0) {
+                if let Ok(sz) = sz_s.parse::<usize>() {
+                    let base = ctx.state.memory.len();
+                    ctx.state.memory.resize(base + sz, 0);
+                    ctx.state.regs.insert(r1, base as u64);
+                }
+            }
+        });
+        // Memory.free ptr (no-op in simple flat memory model)
+        registry.register("Memory", "free", move |_ctx: &mut MniCtx| { /* no-op */ });
+        // Math.sqrt in-place: Math.sqrt src_fpr dest_fpr (by names)
+        registry.register("Math", "sqrt", move |ctx: &mut MniCtx| {
+            if ctx.args.len() >= 2 {
+                let name_to_id = RegisterMap::build_name_to_id();
+                let src = &ctx.args[0]; let dst = &ctx.args[1];
+                if let (Some(&sid), Some(&did)) = (name_to_id.get(src), name_to_id.get(dst)) {
+                    let vbits = *ctx.state.regs.get(&sid).unwrap_or(&0);
+                    let v = f64::from_bits(vbits);
+                    ctx.state.regs.insert(did, v.sqrt().to_bits());
+                }
+            }
+        });
+    }
+
     // Load Lua modules if present
     let _ = load_lua_modules(&mut registry);
 
@@ -224,32 +331,121 @@ pub fn run_masi(masi: &MASIFile) -> Result<(), String> {
         let byte = code[pc]; pc += 1;
         match byte {
             x if x == Op::Nop as u8 => { continue; }
-            x if x == Op::Hlt as u8 => { return Ok(()); }
+            x if x == Op::Hlt as u8 => { return Ok(state); }
             x if x == Op::Mov as u8 => {
                 // dest then source
                 let dest_pos = pc;
                 let _mode = code[pc]; pc += 1; let _id_skip = read_u64_le(code, &mut pc);
                 let src_val = get_operand(code, &mut pc, &mut state);
-                pc = dest_pos; set_operand(code, &mut pc, &mut state, src_val);
+                let after_src = pc;
+                let mut tmp_pc = dest_pos;
+                set_operand(code, &mut tmp_pc, &mut state, src_val);
+                pc = after_src;
+            }
+            // Floating point move: same semantics as MOV, bitwise copy of 64-bit payload
+            x if x == Op::FMov as u8 => {
+                let dest_pos = pc;
+                let _mode = code[pc]; pc += 1; let _id_skip = read_u64_le(code, &mut pc);
+                let src_bits = get_operand(code, &mut pc, &mut state);
+                let after_src = pc;
+                let mut tmp_pc = dest_pos;
+                set_operand(code, &mut tmp_pc, &mut state, src_bits);
+                pc = after_src;
             }
             x if x == Op::Add as u8 => {
                 let dest_mode = code[pc]; pc += 1; let dest_id64 = read_u64_le(code, &mut pc);
                 let src_val = get_operand(code, &mut pc, &mut state);
                 if dest_mode == 1 { let id = dest_id64 as u16; let a = *state.regs.get(&id).unwrap_or(&0); let r = a.wrapping_add(src_val); state.regs.insert(id, r); update_add_flags(a, src_val, r, &mut state); }
             }
+            // Floating point arithmetic: operate on f64 values but store as raw u64 bits; flags set only by FCMP
+            x if x == Op::FAdd as u8 => {
+                let dest_mode = code[pc]; pc += 1; let dest_id64 = read_u64_le(code, &mut pc);
+                let src_bits = get_operand(code, &mut pc, &mut state);
+                if dest_mode == 1 {
+                    let id = dest_id64 as u16;
+                    let a_bits = *state.regs.get(&id).unwrap_or(&0);
+                    let a = f64::from_bits(a_bits);
+                    let b = f64::from_bits(src_bits);
+                    let r = a + b;
+                    state.regs.insert(id, r.to_bits());
+                }
+            }
             x if x == Op::Sub as u8 => {
                 let dest_mode = code[pc]; pc += 1; let dest_id64 = read_u64_le(code, &mut pc);
                 let src_val = get_operand(code, &mut pc, &mut state);
                 if dest_mode == 1 { let id = dest_id64 as u16; let a = *state.regs.get(&id).unwrap_or(&0); let r = a.wrapping_sub(src_val); state.regs.insert(id, r); update_sub_flags(a, src_val, r, &mut state); }
+            }
+            x if x == Op::FSub as u8 => {
+                let dest_mode = code[pc]; pc += 1; let dest_id64 = read_u64_le(code, &mut pc);
+                let src_bits = get_operand(code, &mut pc, &mut state);
+                if dest_mode == 1 {
+                    let id = dest_id64 as u16;
+                    let a_bits = *state.regs.get(&id).unwrap_or(&0);
+                    let a = f64::from_bits(a_bits);
+                    let b = f64::from_bits(src_bits);
+                    let r = a - b;
+                    state.regs.insert(id, r.to_bits());
+                }
+            }
+            x if x == Op::FMul as u8 => {
+                let dest_mode = code[pc]; pc += 1; let dest_id64 = read_u64_le(code, &mut pc);
+                let src_bits = get_operand(code, &mut pc, &mut state);
+                if dest_mode == 1 {
+                    let id = dest_id64 as u16;
+                    let a_bits = *state.regs.get(&id).unwrap_or(&0);
+                    let a = f64::from_bits(a_bits);
+                    let b = f64::from_bits(src_bits);
+                    let r = a * b;
+                    state.regs.insert(id, r.to_bits());
+                }
+            }
+            x if x == Op::FDiv as u8 => {
+                let dest_mode = code[pc]; pc += 1; let dest_id64 = read_u64_le(code, &mut pc);
+                let src_bits = get_operand(code, &mut pc, &mut state);
+                if dest_mode == 1 {
+                    let id = dest_id64 as u16;
+                    let a_bits = *state.regs.get(&id).unwrap_or(&0);
+                    let a = f64::from_bits(a_bits);
+                    let b = f64::from_bits(src_bits);
+                    let r = a / b; // IEEE-754: handles div by zero -> inf or NaN
+                    state.regs.insert(id, r.to_bits());
+                }
             }
             x if x == Op::Cmp as u8 => {
                 let a = get_operand(code, &mut pc, &mut state);
                 let b = get_operand(code, &mut pc, &mut state);
                 let r = a.wrapping_sub(b); update_sub_flags(a, b, r, &mut state);
             }
+            x if x == Op::FCmp as u8 => {
+                let a_bits = get_operand(code, &mut pc, &mut state);
+                let b_bits = get_operand(code, &mut pc, &mut state);
+                let a = f64::from_bits(a_bits);
+                let b = f64::from_bits(b_bits);
+                if a.is_nan() || b.is_nan() {
+                    // unordered
+                    state.flags = (false, false, false, true); // ZF, SF, CF, OF=unordered
+                } else if a == b {
+                    state.flags = (true, false, false, false); // equal
+                } else if a < b {
+                    state.flags = (false, true, false, false); // less-than
+                } else {
+                    state.flags = (false, false, true, false); // greater-than
+                }
+            }
             x if x == Op::Jmp as u8 => { let t = get_operand(code, &mut pc, &mut state); pc = t as usize; }
             x if x == Op::Je  as u8 => { let t = get_operand(code, &mut pc, &mut state); if state.flags.0 { pc = t as usize; } }
             x if x == Op::Jne as u8 => { let t = get_operand(code, &mut pc, &mut state); if !state.flags.0 { pc = t as usize; } }
+            x if x == Op::Jl  as u8 => { let t = get_operand(code, &mut pc, &mut state); let (zf, sf, _cf, of) = state.flags; if (sf ^ of) && !zf { pc = t as usize; } }
+            x if x == Op::Jle as u8 => { let t = get_operand(code, &mut pc, &mut state); let (zf, sf, _cf, of) = state.flags; if zf || (sf ^ of) { pc = t as usize; } }
+            x if x == Op::Jg  as u8 => { let t = get_operand(code, &mut pc, &mut state); let (zf, sf, _cf, of) = state.flags; if !zf && !(sf ^ of) { pc = t as usize; } }
+            x if x == Op::Jge as u8 => { let t = get_operand(code, &mut pc, &mut state); let (_zf, sf, _cf, of) = state.flags; if !(sf ^ of) { pc = t as usize; } }
+            x if x == Op::FJe  as u8 => { let t = get_operand(code, &mut pc, &mut state); if state.flags.0 { pc = t as usize; } }
+            x if x == Op::FJne as u8 => { let t = get_operand(code, &mut pc, &mut state); if !state.flags.0 { pc = t as usize; } }
+            x if x == Op::FJlt as u8 => { let t = get_operand(code, &mut pc, &mut state); if state.flags.1 { pc = t as usize; } }
+            x if x == Op::FJle as u8 => { let t = get_operand(code, &mut pc, &mut state); if state.flags.0 || state.flags.1 { pc = t as usize; } }
+            x if x == Op::FJgt as u8 => { let t = get_operand(code, &mut pc, &mut state); if state.flags.2 { pc = t as usize; } }
+            x if x == Op::FJge as u8 => { let t = get_operand(code, &mut pc, &mut state); if state.flags.0 || state.flags.2 { pc = t as usize; } }
+            x if x == Op::FJuo as u8 => { let t = get_operand(code, &mut pc, &mut state); if state.flags.3 { pc = t as usize; } }
             x if x == Op::Call as u8 => { let t = get_operand(code, &mut pc, &mut state); state.stack.push(pc as u64); pc = t as usize; }
             x if x == Op::Ret as u8 => { if let Some(ret) = state.stack.pop() { pc = ret as usize; } }
             x if x == Op::Push as u8 => { let v = get_operand(code, &mut pc, &mut state); state.stack.push(v); }
@@ -289,13 +485,8 @@ pub fn run_masi(masi: &MASIFile) -> Result<(), String> {
                 // Decode module/function names
                 let mod_name = match m_mode { 3 => read_c_string(m_val, &state.memory), 1 => Some(RegisterMap::build_id_to_name().remove(&(m_val as u16)).unwrap_or_else(|| format!("REG{}", m_val as u16))), 0 => Some(format!("{}", m_val)), 4 => Some(format!("${}", RegisterMap::build_id_to_name().remove(&(m_val as u16)).unwrap_or_else(|| format!("REG{}", m_val as u16)))), _ => None };
                 let fn_name  = match f_mode { 3 => read_c_string(f_val, &state.memory), 1 => Some(RegisterMap::build_id_to_name().remove(&(f_val as u16)).unwrap_or_else(|| format!("REG{}", f_val as u16))), 0 => Some(format!("{}", f_val)), 4 => Some(format!("${}", RegisterMap::build_id_to_name().remove(&(f_val as u16)).unwrap_or_else(|| format!("REG{}", f_val as u16)))), _ => None };
-                println!("[DEBUG] MNI lookup: module={:?}, function={:?}", mod_name, fn_name);
-                println!("[DEBUG] Registered MNI functions:");
-                for (modn, fmap) in &registry.funcs {
-                    for fname in fmap.keys() {
-                        println!("  [{}].[{}]", modn, fname);
-                    }
-                }
+                debug_println!("[DEBUG] MNI lookup: module={:?}, function={:?}", mod_name, fn_name);
+                debug_println!("[DEBUG] Registered MNI functions (omitted in normal run)");
                 if let (Some(mn), Some(fn_)) = (mod_name, fn_name) {
                     let mn_lc = mn.trim().to_lowercase();
                     let fn_lc = fn_.trim().to_lowercase();
@@ -305,48 +496,109 @@ pub fn run_masi(masi: &MASIFile) -> Result<(), String> {
                         state = ctx.state;
                         let rax_id = RegisterMap::build_name_to_id().get("RAX").copied().unwrap_or(0);
                         let rax_val = state.regs.get(&rax_id).copied().unwrap_or(0);
-                        println!("[DEBUG] RAX after MNI: {}", rax_val);
+                        debug_println!("[DEBUG] RAX after MNI: {}", rax_val);
                     } else {
-                        let _ = writeln!(io::stderr(), "MNI: function not found");
+                        let msg = format!("MNI: function not found: {}.{}", mn, fn_);
+                        state.errors.push(msg.clone());
+                        return Err(msg);
                     }
                 } else {
-                    let _ = writeln!(io::stderr(), "MNI: function not found");
+                    let msg = "MNI: module or function decoding failed".to_string();
+                    state.errors.push(msg.clone());
+                    return Err(msg);
+                }
+            }
+            x if x == Op::Syscall as u8 => {
+                // Minimal syscall emulation (runtime-level, not host OS):
+                // RAX: number; args RDI, RSI, RDX, R10, R8, R9. Return in RAX.
+                let nm = RegisterMap::build_name_to_id();
+                let rax = *nm.get("RAX").unwrap_or(&0);
+                let rdi = *nm.get("RDI").unwrap_or(&0);
+                let rsi = *nm.get("RSI").unwrap_or(&0);
+                let rdx = *nm.get("RDX").unwrap_or(&0);
+                let r10 = *nm.get("R10").unwrap_or(&0);
+                let r8  = *nm.get("R8").unwrap_or(&0);
+                let r9  = *nm.get("R9").unwrap_or(&0);
+                let num = *state.regs.get(&rax).unwrap_or(&0);
+                let a1 = *state.regs.get(&rdi).unwrap_or(&0);
+                let a2 = *state.regs.get(&rsi).unwrap_or(&0);
+                let a3 = *state.regs.get(&rdx).unwrap_or(&0);
+                let _a4 = *state.regs.get(&r10).unwrap_or(&0);
+                let _a5 = *state.regs.get(&r8 ).unwrap_or(&0);
+                let _a6 = *state.regs.get(&r9 ).unwrap_or(&0);
+                match num {
+                    60 => { // exit(code)
+                        return Ok(state);
+                    }
+                    1 => { // write(fd, buf, count)
+                        let fd = a1;
+                        let buf = a2 as usize;
+                        let cnt = a3 as usize;
+                        let end = buf.saturating_add(cnt).min(state.memory.len());
+                        let slice = if buf < end { &state.memory[buf..end] } else { &[] };
+                        if fd == 1 { let _ = out.write_all(slice); let _ = out.flush(); }
+                        else if fd == 2 { let _ = err.write_all(slice); let _ = err.flush(); }
+                        state.regs.insert(rax, slice.len() as u64);
+                    }
+                    0 => { // read(fd, buf, count) - only stdin supported
+                        let fd = a1; let buf = a2 as usize; let cnt = a3 as usize;
+                        if fd == 0 {
+                            let mut s = String::new();
+                            match input.as_deref_mut() { Some(r) => { let _ = r.read_line(&mut s); }, None => { let _ = io::stdin().read_line(&mut s); } }
+                            let mut bytes = s.into_bytes();
+                            if bytes.len() > cnt { bytes.truncate(cnt); }
+                            if buf + bytes.len() > state.memory.len() { state.memory.resize(buf + bytes.len(), 0); }
+                            state.memory[buf..buf+bytes.len()].copy_from_slice(&bytes);
+                            state.regs.insert(rax, bytes.len() as u64);
+                        } else { state.regs.insert(rax, 0); }
+                    }
+                    _ => {
+                        // Unimplemented syscalls: return 0
+                        state.regs.insert(rax, 0);
+                    }
                 }
             }
             x if x == Op::Out as u8 => {
                 // OUT port value: print string only if value is a memory address (mode 3 or 4), else print numeric value
                 let port_mode = code[pc]; pc += 1; let port_val = read_u64_le(code, &mut pc);
                 let val_mode = code[pc]; pc += 1; let val_val = read_u64_le(code, &mut pc);
-                let to_err = port_mode == 2;
+                let to_err = port_mode == 2 || port_val == 2;
+                let w: &mut dyn Write = if to_err { err as &mut dyn Write } else { out as &mut dyn Write };
                 match val_mode {
                     3 | 4 => {
-                        // Print string at address
                         if let Some(s) = read_c_string(val_val, &state.memory) {
-                            if to_err { let _ = writeln!(io::stderr(), "{}", s); } else { println!("{}", s); }
+                            let _ = writeln!(w, "{}", s);
                         } else {
-                            if to_err { let _ = writeln!(io::stderr(), "{}", val_val); } else { println!("{}", val_val); }
+                            let _ = writeln!(w, "{}", val_val);
                         }
                     }
                     1 => {
-                        // Print value in register
                         let reg_val = state.regs.get(&(val_val as u16)).copied().unwrap_or(0);
-                        if to_err { let _ = writeln!(io::stderr(), "{}", reg_val); } else { println!("{}", reg_val); }
+                        let _ = writeln!(w, "{}", reg_val);
                     }
                     _ => {
-                        // Print numeric value
-                        if to_err { let _ = writeln!(io::stderr(), "{}", val_val); } else { println!("{}", val_val); }
+                        let _ = writeln!(w, "{}", val_val);
                     }
                 }
             }
             x if x == Op::COut as u8 => {
                 let p = get_operand(code, &mut pc, &mut state);
                 let v = get_operand(code, &mut pc, &mut state);
-                let to_err = p == 2; let ch: u8 = if (v as usize) < state.memory.len() { state.memory[v as usize] } else { v as u8 };
-                if to_err { let _ = io::stderr().write_all(&[ch]); } else { print!("{}", ch as char); let _ = io::stdout().flush(); }
+                let to_err = p == 2;
+                let ch: u8 = if (v as usize) < state.memory.len() { state.memory[v as usize] } else { v as u8 };
+                if to_err { let _ = err.write_all(&[ch]); let _ = err.flush(); } else { let _ = out.write_all(&[ch]); let _ = out.flush(); }
             }
             x if x == Op::In as u8 => {
                 let dest_addr = get_operand(code, &mut pc, &mut state) as usize;
-                let mut line = String::new(); let _ = io::stdin().read_line(&mut line);
+                let mut line = String::new();
+                match input.as_deref_mut() {
+                    Some(reader) => {
+                        let _ = reader.read_line(&mut line);
+                    }
+                    None => {
+                        let _ = io::stdin().read_line(&mut line);
+                    }
+                }
                 let mut bytes = line.into_bytes(); bytes.push(0);
                 if dest_addr + bytes.len() > state.memory.len() { state.memory.resize(dest_addr + bytes.len(), 0); }
                 state.memory[dest_addr..dest_addr+bytes.len()].copy_from_slice(&bytes);
@@ -354,5 +606,5 @@ pub fn run_masi(masi: &MASIFile) -> Result<(), String> {
             _ => {}
         }
     }
-    Ok(())
+    Ok(state)
 }

@@ -66,7 +66,8 @@ fn main() {
         // Assemble
         let out_path = output.unwrap_or_else(|| PathBuf::from("out.masi"));
         let src = match fs::read_to_string(&input_path) { Ok(s) => s, Err(e) => { eprintln!("Failed to read {}: {}", input_path.display(), e); return; } };
-        match assembler::assemble_to_masi(&src) {
+        let base = input_path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| ".".to_string());
+        match assembler::assemble_to_masi_with_base(&src, &base) {
             Ok(bytes) => {
                 if let Err(e) = fs::write(&out_path, bytes) { eprintln!("Failed to write {}: {}", out_path.display(), e); return; }
                 println!("Wrote MASI to {}", out_path.display());
