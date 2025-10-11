@@ -95,6 +95,18 @@ struct DataSections {
     directives: Vec<DataDirective>,
     data_label_offsets: HashMap<String, usize>,
     mni_string_labels: HashMap<String, String>, // content -> gen label
+    // New: export/import support
+    export_symbols: Vec<String>,              // raw names (may start with '#' for code or '$' for data)
+    import_kinds: HashMap<String, u8>,        // name -> kind (0=code, 1=data)
+    relocations: Vec<Reloc>,                  // collected during encode
+}
+
+#[derive(Debug, Clone)]
+struct Reloc {
+    name: String,      // symbol name (without prefix)
+    kind: u8,          // 0=code, 1=data
+    section: u8,       // 0=code for now
+    offset: usize,     // where to write u64 in section
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +121,7 @@ enum DataDirective {
     DirectDb{ address: usize, bytes: Vec<u8>, null_terminated: bool },
 }
 
+#[allow(dead_code)]
 fn is_register(s: &str, reg_map: &HashMap<String, u16>) -> bool {
     reg_map.contains_key(&s.to_uppercase())
 }
@@ -166,6 +179,33 @@ fn parse_data_line(line: &str, data: &mut DataSections) -> bool {
         }
     }
     let lower = rest.to_lowercase();
+    // Handle simple preprocessor export/import directives here so they don't become instructions
+    if lower.starts_with("#export ") {
+        let name = rest[8..].trim().to_string();
+        if !name.is_empty() { data.export_symbols.push(name); }
+        return true;
+    }
+    if lower.starts_with("#import ") {
+        // Forms:
+        //   #import code foo
+        //   #import data bar
+        //   #import foo           (defaults to code)
+        let args = rest[8..].trim();
+        let mut parts = args.split_whitespace();
+        if let Some(a) = parts.next() {
+            let (kind, name) = match a.to_ascii_lowercase().as_str() {
+                "code" => (0u8, parts.next().unwrap_or("").to_string()),
+                "data" => (1u8, parts.next().unwrap_or("").to_string()),
+                _ => (0u8, a.to_string()),
+            };
+            if !name.is_empty() {
+                data.import_kinds.insert(name, kind);
+            } else if !a.is_empty() && (a == "code" || a == "data") == false {
+                // Already handled in default case above
+            }
+        }
+        return true;
+    }
     let parse_values = |part: &str| -> Vec<String> { part.split(',').map(|s| s.trim().to_string()).collect() };
 
     if lower.starts_with("state ") {
@@ -286,7 +326,7 @@ fn expand_macros(src: &str) -> String {
     struct MacroDef { name: String, params: Vec<String>, body: Vec<String> }
     let mut defs: HashMap<String, MacroDef> = HashMap::new();
     let mut out_lines: Vec<String> = Vec::new();
-    let mut lines: Vec<String> = src.lines().map(|s| s.to_string()).collect();
+    let lines: Vec<String> = src.lines().map(|s| s.to_string()).collect();
     let mut i = 0;
     while i < lines.len() {
         let mut line = lines[i].clone();
@@ -587,6 +627,50 @@ fn encode_operand(s: &str, labels: &HashMap<String, usize>, data_labels: &HashMa
     (0, 0)
 }
 
+// Helper: write an operand into code, generating relocations for unresolved imports.
+fn emit_operand_into(
+    code: &mut Vec<u8>,
+    operand: &str,
+    labels: &HashMap<String, usize>,
+    data_labels: &HashMap<String, usize>,
+    reg_map: &HashMap<String, u16>,
+    import_kinds: &HashMap<String, u8>,
+    relocs: &mut Vec<Reloc>,
+) {
+    let (mode, val, reloc): (u8, u64, Option<(String, u8)>) = {
+        if let Some(name) = operand.strip_prefix('#') {
+            if !labels.contains_key(name) {
+                (2, 0, Some((name.to_string(), 0)))
+            } else { let (m,v) = encode_operand(operand, labels, data_labels, reg_map); (m,v,None) }
+        } else if let Some(rest) = operand.strip_prefix('$') {
+            let up = rest.to_uppercase();
+            if reg_map.contains_key(&up) {
+                let (m,v) = encode_operand(operand, labels, data_labels, reg_map); (m,v,None)
+            } else if !data_labels.contains_key(rest) {
+                // If it's a numeric literal (hex or dec), treat as direct memory address, not import
+                if let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+                    if let Ok(v) = u64::from_str_radix(hex, 16) { (3, v, None) } else { (3, 0, Some((rest.to_string(), 1))) }
+                } else if rest.chars().all(|c| c.is_ascii_digit()) {
+                    if let Ok(v) = rest.parse::<u64>() { (3, v, None) } else { (3, 0, Some((rest.to_string(), 1))) }
+                } else {
+                    (3, 0, Some((rest.to_string(), 1)))
+                }
+            } else { let (m,v) = encode_operand(operand, labels, data_labels, reg_map); (m,v,None) }
+        } else {
+            if labels.contains_key(operand) || data_labels.contains_key(operand) || reg_map.contains_key(&operand.to_uppercase()) || operand.starts_with("0x") || operand.chars().all(|c| c.is_ascii_digit()) {
+                let (m,v) = encode_operand(operand, labels, data_labels, reg_map); (m,v,None)
+            } else if let Some(k) = import_kinds.get(operand).copied() {
+                let mode = if k==0 { 2 } else { 3 }; (mode, 0, Some((operand.to_string(), k)))
+            } else { let (m,v) = encode_operand(operand, labels, data_labels, reg_map); (m,v,None) }
+        }
+    };
+    code.push(mode);
+    let patch_off = code.len();
+    write_u64_le(val, code);
+    if let Some((name, kind)) = reloc { relocs.push(Reloc { name, kind, section: 0, offset: patch_off }); }
+}
+
+#[allow(dead_code)]
 pub fn assemble_to_masi(src: &str) -> Result<Vec<u8>, String> {
     let reg_map = RegisterMap::build_name_to_id();
     // Expand includes first to error early on missing files
@@ -654,8 +738,8 @@ pub fn assemble_to_masi(src: &str) -> Result<Vec<u8>, String> {
         }
     }
 
-    // Tables
-    let import_table: Vec<u8> = Vec::new();
+    // Tables (we will fill import/export below)
+    let mut import_table: Vec<u8> = Vec::new();
     // locals: count u16 + entries: nameLen u16 + name + offset u64
     let mut locals: Vec<u8> = Vec::new();
     write_u16_le(data.data_label_offsets.len() as u16, &mut locals);
@@ -666,7 +750,7 @@ pub fn assemble_to_masi(src: &str) -> Result<Vec<u8>, String> {
         write_u64_le(*off as u64, &mut locals);
     }
     let const_table: Vec<u8> = Vec::new();
-    let export_table: Vec<u8> = Vec::new();
+    let mut export_table: Vec<u8> = Vec::new();
 
     // Label table: count u16 + entries: nameLen u16 + name + addr u64
     let mut label_table: Vec<u8> = Vec::new();
@@ -678,106 +762,142 @@ pub fn assemble_to_masi(src: &str) -> Result<Vec<u8>, String> {
         write_u64_le(*off as u64, &mut label_table);
     }
 
-    // Code second pass
+    // Code second pass (with relocations for imports)
     let mut code: Vec<u8> = Vec::new();
+    data.relocations.clear();
+
+    fn emit_operand_into(
+        code: &mut Vec<u8>,
+        operand: &str,
+        labels: &HashMap<String, usize>,
+        data_labels: &HashMap<String, usize>,
+        reg_map: &HashMap<String, u16>,
+        import_kinds: &HashMap<String, u8>,
+        relocs: &mut Vec<Reloc>,
+    ) {
+        let (mode, val, reloc): (u8, u64, Option<(String, u8)>) = {
+            if let Some(name) = operand.strip_prefix('#') {
+                if !labels.contains_key(name) {
+                    (2, 0, Some((name.to_string(), 0)))
+                } else { let (m,v) = encode_operand(operand, labels, data_labels, reg_map); (m,v,None) }
+            } else if let Some(rest) = operand.strip_prefix('$') {
+                let up = rest.to_uppercase();
+                if reg_map.contains_key(&up) {
+                    let (m,v) = encode_operand(operand, labels, data_labels, reg_map); (m,v,None)
+                } else if !data_labels.contains_key(rest) {
+                    // If it's a numeric literal (hex or dec), treat as direct memory address, not import
+                    if let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+                        if let Ok(v) = u64::from_str_radix(hex, 16) { (3, v, None) } else { (3, 0, Some((rest.to_string(), 1))) }
+                    } else if rest.chars().all(|c| c.is_ascii_digit()) {
+                        if let Ok(v) = rest.parse::<u64>() { (3, v, None) } else { (3, 0, Some((rest.to_string(), 1))) }
+                    } else {
+                        (3, 0, Some((rest.to_string(), 1)))
+                    }
+                } else { let (m,v) = encode_operand(operand, labels, data_labels, reg_map); (m,v,None) }
+            } else {
+                if labels.contains_key(operand) || data_labels.contains_key(operand) || reg_map.contains_key(&operand.to_uppercase()) || operand.starts_with("0x") || operand.chars().all(|c| c.is_ascii_digit()) {
+                    let (m,v) = encode_operand(operand, labels, data_labels, reg_map); (m,v,None)
+                } else if let Some(k) = import_kinds.get(operand).copied() {
+                    let mode = if k==0 { 2 } else { 3 }; (mode, 0, Some((operand.to_string(), k)))
+                } else { let (m,v) = encode_operand(operand, labels, data_labels, reg_map); (m,v,None) }
+            }
+        };
+        code.push(mode);
+        let patch_off = code.len();
+        write_u64_le(val, code);
+        if let Some((name, kind)) = reloc { relocs.push(Reloc { name, kind, section: 0, offset: patch_off }); }
+    }
     for ins in &insts {
         match ins {
             Instruction::Label(_) => {}
-            Instruction::Mov(d, s) => {
-                code.push(Op::Mov as u8);
-                let (m, v) = encode_operand(d, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(s, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
-            Instruction::FMov(d, s) => {
-                code.push(Op::FMov as u8);
-                let (m, v) = encode_operand(d, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(s, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
-            Instruction::Add(d, s) => {
-                code.push(Op::Add as u8);
-                let (m, v) = encode_operand(d, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(s, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
-            Instruction::FAdd(d, s) => {
-                code.push(Op::FAdd as u8);
-                let (m, v) = encode_operand(d, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(s, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
-            Instruction::Sub(d, s) => {
-                code.push(Op::Sub as u8);
-                let (m, v) = encode_operand(d, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(s, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
-            Instruction::FSub(d, s) => {
-                code.push(Op::FSub as u8);
-                let (m, v) = encode_operand(d, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(s, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
-            Instruction::FMul(d, s) => {
-                code.push(Op::FMul as u8);
-                let (m, v) = encode_operand(d, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(s, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
-            Instruction::FDiv(d, s) => {
-                code.push(Op::FDiv as u8);
-                let (m, v) = encode_operand(d, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(s, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
-            Instruction::Cmp(a, b) => {
-                code.push(Op::Cmp as u8);
-                let (m, v) = encode_operand(a, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(b, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
-            Instruction::FCmp(a, b) => {
-                code.push(Op::FCmp as u8);
-                let (m, v) = encode_operand(a, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(b, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
-            Instruction::Jmp(t) => { code.push(Op::Jmp as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            Instruction::Je(t)  => { code.push(Op::Je  as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            Instruction::Jne(t) => { code.push(Op::Jne as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            Instruction::Jl(t)  => { code.push(Op::Jl  as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            Instruction::Jle(t) => { code.push(Op::Jle as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            Instruction::Jg(t)  => { code.push(Op::Jg  as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            Instruction::Jge(t) => { code.push(Op::Jge as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            Instruction::FJe(t)  => { code.push(Op::FJe  as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            Instruction::FJne(t) => { code.push(Op::FJne as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            Instruction::FJlt(t) => { code.push(Op::FJlt as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            Instruction::FJle(t) => { code.push(Op::FJle as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            Instruction::FJgt(t) => { code.push(Op::FJgt as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            Instruction::FJge(t) => { code.push(Op::FJge as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            Instruction::FJuo(t) => { code.push(Op::FJuo as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            Instruction::Call(t)=> { code.push(Op::Call as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
+            Instruction::Mov(d, s) => { code.push(Op::Mov as u8); emit_operand_into(&mut code, d, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, s, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::FMov(d, s) => { code.push(Op::FMov as u8); emit_operand_into(&mut code, d, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, s, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::Add(d, s) => { code.push(Op::Add as u8); emit_operand_into(&mut code, d, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, s, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::FAdd(d, s) => { code.push(Op::FAdd as u8); emit_operand_into(&mut code, d, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, s, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::Sub(d, s) => { code.push(Op::Sub as u8); emit_operand_into(&mut code, d, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, s, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::FSub(d, s) => { code.push(Op::FSub as u8); emit_operand_into(&mut code, d, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, s, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::FMul(d, s) => { code.push(Op::FMul as u8); emit_operand_into(&mut code, d, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, s, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::FDiv(d, s) => { code.push(Op::FDiv as u8); emit_operand_into(&mut code, d, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, s, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::Cmp(a, b) => { code.push(Op::Cmp as u8); emit_operand_into(&mut code, a, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, b, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::FCmp(a, b) => { code.push(Op::FCmp as u8); emit_operand_into(&mut code, a, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, b, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::Jmp(t) => { code.push(Op::Jmp as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::Je(t)  => { code.push(Op::Je  as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::Jne(t) => { code.push(Op::Jne as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::Jl(t)  => { code.push(Op::Jl  as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::Jle(t) => { code.push(Op::Jle as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::Jg(t)  => { code.push(Op::Jg  as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::Jge(t) => { code.push(Op::Jge as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::FJe(t)  => { code.push(Op::FJe  as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::FJne(t) => { code.push(Op::FJne as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::FJlt(t) => { code.push(Op::FJlt as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::FJle(t) => { code.push(Op::FJle as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::FJgt(t) => { code.push(Op::FJgt as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::FJge(t) => { code.push(Op::FJge as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::FJuo(t) => { code.push(Op::FJuo as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::Call(t)=> { code.push(Op::Call as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
             Instruction::Ret   => { code.push(Op::Ret as u8); }
-            Instruction::Push(v)=> { code.push(Op::Push as u8); let (m, v) = encode_operand(v, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            Instruction::Pop(d) => { code.push(Op::Pop  as u8); let (m, v) = encode_operand(d, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            Instruction::Out(p, v)=> {
-                code.push(Op::Out as u8);
-                let (m, vv) = encode_operand(p, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(vv, &mut code);
-                let (m, vv) = encode_operand(v, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(vv, &mut code);
-            }
-            Instruction::COut(p, v)=> {
-                code.push(Op::COut as u8);
-                let (m, vv) = encode_operand(p, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(vv, &mut code);
-                let (m, vv) = encode_operand(v, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(vv, &mut code);
-            }
-            Instruction::In(d) => {
-                code.push(Op::In as u8);
-                let (m, v) = encode_operand(d, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
+            Instruction::Push(v)=> { code.push(Op::Push as u8); emit_operand_into(&mut code, v, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::Pop(d) => { code.push(Op::Pop  as u8); emit_operand_into(&mut code, d, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::Out(p, v)=> { code.push(Op::Out as u8); emit_operand_into(&mut code, p, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, v, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::COut(p, v)=> { code.push(Op::COut as u8); emit_operand_into(&mut code, p, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, v, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            Instruction::In(d) => { code.push(Op::In as u8); emit_operand_into(&mut code, d, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
             Instruction::Hlt => { code.push(Op::Hlt as u8); }
             Instruction::Nop => { code.push(Op::Nop as u8); }
-            Instruction::Enter(sz)=> { code.push(Op::Enter as u8); let (m, v) = encode_operand(sz, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
+            Instruction::Enter(sz)=> { code.push(Op::Enter as u8); emit_operand_into(&mut code, sz, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
             Instruction::Leave   => { code.push(Op::Leave as u8); }
             Instruction::Mni{ module_ptr, function_ptr, args } => {
                 code.push(Op::Mni as u8);
-                let (m, v) = encode_operand(module_ptr, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(function_ptr, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
+                emit_operand_into(&mut code, module_ptr, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations);
+                emit_operand_into(&mut code, function_ptr, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations);
                 write_u16_le(args.len() as u16, &mut code);
-                for a in args { let (m, v) = encode_operand(&format!("${}", a), &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
+                for a in args { let tmp = format!("${}", a); emit_operand_into(&mut code, &tmp, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
             }
             Instruction::Syscall => { code.push(Op::Syscall as u8); }
         }
+    }
+
+    // Build export table: format
+    //   count u16
+    //   entries: kind u8 (0=code,1=data) + nameLen u16 + name bytes + offset u64
+    let mut exports: Vec<(u8,String,u64)> = Vec::new();
+    for raw in &data.export_symbols {
+        let (kind, name) = if let Some(n) = raw.strip_prefix('#') { (0u8, n.to_string()) }
+                           else if let Some(n) = raw.strip_prefix('$') { (1u8, n.to_string()) }
+                           else { (0u8, raw.clone()) };
+        match kind {
+            0 => {
+                if let Some(off) = labels.get(&name) { exports.push((0, name.clone(), *off as u64)); }
+            }
+            1 => {
+                if let Some(off) = data.data_label_offsets.get(&name) { exports.push((1, name.clone(), *off as u64)); }
+            }
+            _ => {}
+        }
+    }
+    write_u16_le(exports.len() as u16, &mut export_table);
+    for (k, n, off) in exports {
+        export_table.push(k);
+        let nb = n.as_bytes();
+        write_u16_le(nb.len() as u16, &mut export_table);
+        export_table.extend_from_slice(nb);
+        write_u64_le(off, &mut export_table);
+    }
+
+    // Build import table with relocations:
+    //   count u16
+    //   for each imported name: kind u8 + nameLen u16 + name + refCount u16 + refs[(section u8, offset u64)]
+    // Group relocations by (name,kind)
+    use std::collections::BTreeMap;
+    let mut grouped: BTreeMap<(String,u8), Vec<(u8,usize)>> = BTreeMap::new();
+    for r in &data.relocations { grouped.entry((r.name.clone(), r.kind)).or_default().push((r.section, r.offset)); }
+    write_u16_le(grouped.len() as u16, &mut import_table);
+    for ((name, kind), refs) in grouped {
+        import_table.push(kind);
+        let nb = name.as_bytes();
+        write_u16_le(nb.len() as u16, &mut import_table);
+        import_table.extend_from_slice(nb);
+        write_u16_le(refs.len() as u16, &mut import_table);
+        for (sec, off) in refs { import_table.push(sec); write_u64_le(off as u64, &mut import_table); }
     }
 
     // Header (16): 'MASI', version u16(1), reserved u16(0), entry u64
@@ -877,7 +997,7 @@ pub fn assemble_to_masi_with_base(src: &str, base_dir: &str) -> Result<Vec<u8>, 
     }
 
     // Tables
-    let import_table: Vec<u8> = Vec::new();
+    let mut import_table: Vec<u8> = Vec::new();
     // locals: count u16 + entries: nameLen u16 + name + offset u64
     let mut locals: Vec<u8> = Vec::new();
     write_u16_le(data.data_label_offsets.len() as u16, &mut locals);
@@ -888,7 +1008,7 @@ pub fn assemble_to_masi_with_base(src: &str, base_dir: &str) -> Result<Vec<u8>, 
         write_u64_le(*off as u64, &mut locals);
     }
     let const_table: Vec<u8> = Vec::new();
-    let export_table: Vec<u8> = Vec::new();
+    let mut export_table: Vec<u8> = Vec::new();
 
     // Label table: count u16 + entries: nameLen u16 + name + addr u64
     let mut label_table: Vec<u8> = Vec::new();
@@ -900,103 +1020,53 @@ pub fn assemble_to_masi_with_base(src: &str, base_dir: &str) -> Result<Vec<u8>, 
         write_u64_le(*off as u64, &mut label_table);
     }
 
-    // Code second pass
+    // Code second pass (with relocations)
     let mut code: Vec<u8> = Vec::new();
+    data.relocations.clear();
     for ins in &insts {
         match ins {
             Instruction::Label(_) => {}
-            ,Instruction::Mov(d, s) => {
-                code.push(Op::Mov as u8);
-                let (m, v) = encode_operand(d, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(s, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
-            ,Instruction::FMov(d, s) => {
-                code.push(Op::FMov as u8);
-                let (m, v) = encode_operand(d, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(s, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
-            ,Instruction::Add(d, s) => {
-                code.push(Op::Add as u8);
-                let (m, v) = encode_operand(d, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(s, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
-            ,Instruction::FAdd(d, s) => {
-                code.push(Op::FAdd as u8);
-                let (m, v) = encode_operand(d, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(s, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
-            ,Instruction::Sub(d, s) => {
-                code.push(Op::Sub as u8);
-                let (m, v) = encode_operand(d, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(s, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
-            ,Instruction::FSub(d, s) => {
-                code.push(Op::FSub as u8);
-                let (m, v) = encode_operand(d, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(s, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
-            ,Instruction::FMul(d, s) => {
-                code.push(Op::FMul as u8);
-                let (m, v) = encode_operand(d, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(s, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
-            ,Instruction::FDiv(d, s) => {
-                code.push(Op::FDiv as u8);
-                let (m, v) = encode_operand(d, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(s, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
-            ,Instruction::Cmp(a, b) => {
-                code.push(Op::Cmp as u8);
-                let (m, v) = encode_operand(a, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(b, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
-            ,Instruction::FCmp(a, b) => {
-                code.push(Op::FCmp as u8);
-                let (m, v) = encode_operand(a, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(b, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
-            ,Instruction::Jmp(t) => { code.push(Op::Jmp as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            ,Instruction::Je(t)  => { code.push(Op::Je  as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            ,Instruction::Jne(t) => { code.push(Op::Jne as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            ,Instruction::Jl(t)  => { code.push(Op::Jl  as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            ,Instruction::Jle(t) => { code.push(Op::Jle as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            ,Instruction::Jg(t)  => { code.push(Op::Jg  as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            ,Instruction::Jge(t) => { code.push(Op::Jge as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            ,Instruction::FJe(t)  => { code.push(Op::FJe  as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            ,Instruction::FJne(t) => { code.push(Op::FJne as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            ,Instruction::FJlt(t) => { code.push(Op::FJlt as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            ,Instruction::FJle(t) => { code.push(Op::FJle as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            ,Instruction::FJgt(t) => { code.push(Op::FJgt as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            ,Instruction::FJge(t) => { code.push(Op::FJge as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            ,Instruction::FJuo(t) => { code.push(Op::FJuo as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            ,Instruction::Call(t)=> { code.push(Op::Call as u8); let (m, v) = encode_operand(t, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
+            ,Instruction::Mov(d, s) => { code.push(Op::Mov as u8); emit_operand_into(&mut code, d, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, s, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::FMov(d, s) => { code.push(Op::FMov as u8); emit_operand_into(&mut code, d, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, s, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::Add(d, s) => { code.push(Op::Add as u8); emit_operand_into(&mut code, d, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, s, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::FAdd(d, s) => { code.push(Op::FAdd as u8); emit_operand_into(&mut code, d, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, s, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::Sub(d, s) => { code.push(Op::Sub as u8); emit_operand_into(&mut code, d, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, s, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::FSub(d, s) => { code.push(Op::FSub as u8); emit_operand_into(&mut code, d, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, s, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::FMul(d, s) => { code.push(Op::FMul as u8); emit_operand_into(&mut code, d, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, s, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::FDiv(d, s) => { code.push(Op::FDiv as u8); emit_operand_into(&mut code, d, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, s, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::Cmp(a, b) => { code.push(Op::Cmp as u8); emit_operand_into(&mut code, a, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, b, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::FCmp(a, b) => { code.push(Op::FCmp as u8); emit_operand_into(&mut code, a, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, b, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::Jmp(t) => { code.push(Op::Jmp as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::Je(t)  => { code.push(Op::Je  as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::Jne(t) => { code.push(Op::Jne as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::Jl(t)  => { code.push(Op::Jl  as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::Jle(t) => { code.push(Op::Jle as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::Jg(t)  => { code.push(Op::Jg  as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::Jge(t) => { code.push(Op::Jge as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::FJe(t)  => { code.push(Op::FJe  as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::FJne(t) => { code.push(Op::FJne as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::FJlt(t) => { code.push(Op::FJlt as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::FJle(t) => { code.push(Op::FJle as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::FJgt(t) => { code.push(Op::FJgt as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::FJge(t) => { code.push(Op::FJge as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::FJuo(t) => { code.push(Op::FJuo as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::Call(t)=> { code.push(Op::Call as u8); emit_operand_into(&mut code, t, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
             ,Instruction::Ret   => { code.push(Op::Ret as u8); }
-            ,Instruction::Push(v)=> { code.push(Op::Push as u8); let (m, v) = encode_operand(v, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            ,Instruction::Pop(d) => { code.push(Op::Pop  as u8); let (m, v) = encode_operand(d, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
-            ,Instruction::Out(p, v)=> {
-                code.push(Op::Out as u8);
-                let (m, vv) = encode_operand(p, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(vv, &mut code);
-                let (m, vv) = encode_operand(v, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(vv, &mut code);
-            }
-            ,Instruction::COut(p, v)=> {
-                code.push(Op::COut as u8);
-                let (m, vv) = encode_operand(p, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(vv, &mut code);
-                let (m, vv) = encode_operand(v, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(vv, &mut code);
-            }
-            ,Instruction::In(d) => {
-                code.push(Op::In as u8);
-                let (m, v) = encode_operand(d, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-            }
+            ,Instruction::Push(v)=> { code.push(Op::Push as u8); emit_operand_into(&mut code, v, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::Pop(d) => { code.push(Op::Pop  as u8); emit_operand_into(&mut code, d, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::Out(p, v)=> { code.push(Op::Out as u8); emit_operand_into(&mut code, p, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, v, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::COut(p, v)=> { code.push(Op::COut as u8); emit_operand_into(&mut code, p, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); emit_operand_into(&mut code, v, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
+            ,Instruction::In(d) => { code.push(Op::In as u8); emit_operand_into(&mut code, d, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
             ,Instruction::Hlt => { code.push(Op::Hlt as u8); }
             ,Instruction::Nop => { code.push(Op::Nop as u8); }
-            ,Instruction::Enter(sz)=> { code.push(Op::Enter as u8); let (m, v) = encode_operand(sz, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
+            ,Instruction::Enter(sz)=> { code.push(Op::Enter as u8); emit_operand_into(&mut code, sz, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
             ,Instruction::Leave   => { code.push(Op::Leave as u8); }
             ,Instruction::Mni{ module_ptr, function_ptr, args } => {
                 code.push(Op::Mni as u8);
-                let (m, v) = encode_operand(module_ptr, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
-                let (m, v) = encode_operand(function_ptr, &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code);
+                emit_operand_into(&mut code, module_ptr, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations);
+                emit_operand_into(&mut code, function_ptr, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations);
                 write_u16_le(args.len() as u16, &mut code);
-                for a in args { let (m, v) = encode_operand(&format!("${}", a), &labels, &data.data_label_offsets, &reg_map); code.push(m); write_u64_le(v, &mut code); }
+                for a in args { let tmp = format!("${}", a); emit_operand_into(&mut code, &tmp, &labels, &data.data_label_offsets, &reg_map, &data.import_kinds, &mut data.relocations); }
             }
             ,Instruction::Syscall => { code.push(Op::Syscall as u8); }
         }
@@ -1018,6 +1088,28 @@ pub fn assemble_to_masi_with_base(src: &str, base_dir: &str) -> Result<Vec<u8>, 
 
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(&header);
+    // Build export/import tables same as above
+    // Exports
+    let mut exports: Vec<(u8,String,u64)> = Vec::new();
+    for raw in &data.export_symbols {
+        let (kind, name) = if let Some(n) = raw.strip_prefix('#') { (0u8, n.to_string()) }
+                           else if let Some(n) = raw.strip_prefix('$') { (1u8, n.to_string()) }
+                           else { (0u8, raw.clone()) };
+        match kind {
+            0 => { if let Some(off) = labels.get(&name) { exports.push((0, name.clone(), *off as u64)); } }
+            1 => { if let Some(off) = data.data_label_offsets.get(&name) { exports.push((1, name.clone(), *off as u64)); } }
+            _ => {}
+        }
+    }
+    write_u16_le(exports.len() as u16, &mut export_table);
+    for (k, n, off) in exports { export_table.push(k); let nb = n.as_bytes(); write_u16_le(nb.len() as u16, &mut export_table); export_table.extend_from_slice(nb); write_u64_le(off, &mut export_table); }
+    // Imports (relocations)
+    use std::collections::BTreeMap as _Btm;
+    let mut grouped: _Btm<(String,u8), Vec<(u8,usize)>> = _Btm::new();
+    for r in &data.relocations { grouped.entry((r.name.clone(), r.kind)).or_default().push((r.section, r.offset)); }
+    write_u16_le(grouped.len() as u16, &mut import_table);
+    for ((name, kind), refs) in grouped { import_table.push(kind); let nb = name.as_bytes(); write_u16_le(nb.len() as u16, &mut import_table); import_table.extend_from_slice(nb); write_u16_le(refs.len() as u16, &mut import_table); for (sec, off) in refs { import_table.push(sec); write_u64_le(off as u64, &mut import_table); } }
+
     chunk(&mut out, &import_table);
     chunk(&mut out, &locals);
     chunk(&mut out, &label_table);

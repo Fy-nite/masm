@@ -1,0 +1,13 @@
+# ninja log v6
+832	4575	7818798850720394	CMakeFiles/MasmEditor.dir/SymbolsViewer.cpp.obj	a1bc95bf753cdcb8
+828	3876	7818798850679655	CMakeFiles/MasmEditor.dir/MasmEditor_autogen/mocs_compilation.cpp.obj	7309fe623a810d5d
+35	827	7818798849855661	D:/valamasm/Editor/MasmEditor_autogen/mocs_compilation.cpp	cce7516a1c618670
+35	827	7818798849855661	D:/valamasm/Editor/MasmEditor_autogen/timestamp	cce7516a1c618670
+834	4187	7818746347175326	CMakeFiles/MasmEditor.dir/MicroHighlighter.cpp.obj	b2d0d01b3c9dc0eb
+5147	6115	7818798893865922	MasmEditor.exe	1659e28221f8cd92
+835	5146	7818798850760457	CMakeFiles/MasmEditor.dir/main.cpp.obj	cea83633050cc215
+35	827	7818798849855661	MasmEditor_autogen/mocs_compilation.cpp	cce7516a1c618670
+35	827	7818798849855661	MasmEditor_autogen/timestamp	cce7516a1c618670
+30	1677	7818768196042446	build.ninja	e1518659d093a64e
+35	2733	7818755892009611	CMakeFiles/MasmEditor.dir/Indexer.cpp.obj	988afdb310e9caed
+3390	14187	7818741272255633	CMakeFiles/MasmEditor.dir/CodeEditor.cpp.obj	8539860203b22bdb

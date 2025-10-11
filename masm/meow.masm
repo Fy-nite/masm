@@ -1,0 +1,5 @@
+hello: db "hello world\n"
+meow: db "meow\n"
+
+#export  $hello
+#export  $meow

@@ -1,14 +1,12 @@
+#import data meow
 lbl main
     mov RAX 0
     mov RBX 100
     out RAX RBX
-    db $100 "meow\n"
     call #meow
     hlt
 
 lbl meow
-    out RAX $RBX
-    mni tool.set_rax 5
-    MNI MyLib.my_func "hello_from_masm"
+    out RAX $meow
     out 1 RAX
     ret ; lets

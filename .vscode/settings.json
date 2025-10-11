@@ -1,0 +1,7 @@
+{
+    "cmake.sourceDirectory": "D:/valamasm/Editor",
+    "files.associations": {
+        "*.uh": "uhigh",
+        "qplaintextedit": "cpp"
+    }
+}

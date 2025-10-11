@@ -13,7 +13,17 @@ pub struct MASIFile {
     pub section_sizes: HashMap<String, usize>,
     pub data_label_map: HashMap<u64, String>, // data offset -> name
     pub data: Vec<u8>,
+    pub exports: Vec<ExportSym>,
+    pub imports: Vec<ImportSym>,
 }
+
+#[derive(Clone)]
+pub struct ExportSym { pub kind: u8, pub name: String, pub offset: u64 }
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct ImportRef { pub section: u8, pub offset: u64 }
+#[derive(Clone)]
+pub struct ImportSym { pub kind: u8, pub name: String, pub refs: Vec<ImportRef> }
 
 pub fn load(path: &str) -> Result<MASIFile, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
@@ -23,7 +33,7 @@ pub fn load(path: &str) -> Result<MASIFile, String> {
     let version = read_u16_le(&bytes, &mut off);
     let _reserved = read_u16_le(&bytes, &mut off);
     let entry = read_u64_le(&bytes, &mut off);
-    let mut read_chunk = |off: &mut usize| -> Vec<u8> {
+    let read_chunk = |off: &mut usize| -> Vec<u8> {
         let sz = read_u32_le(&bytes, off) as usize;
         let start = *off; let end = start + sz; *off = end; bytes[start..end].to_vec()
     };
@@ -67,6 +77,44 @@ pub fn load(path: &str) -> Result<MASIFile, String> {
         }
     }
 
+    // Parse export_table: count u16, entries (kind u8, nameLen u16, name, offset u64)
+    let mut ex_off = 0usize;
+    let mut exports: Vec<ExportSym> = Vec::new();
+    if export_table.len() >= 2 {
+        let count = read_u16_le(&export_table, &mut ex_off) as usize;
+        for _ in 0..count {
+            if ex_off + 3 > export_table.len() { break; }
+            let kind = export_table[ex_off]; ex_off += 1;
+            let name_len = read_u16_le(&export_table, &mut ex_off) as usize;
+            if ex_off + name_len + 8 > export_table.len() { break; }
+            let name = String::from_utf8(export_table[ex_off..ex_off+name_len].to_vec()).unwrap_or_default(); ex_off += name_len;
+            let offv = read_u64_le(&export_table, &mut ex_off);
+            exports.push(ExportSym { kind, name, offset: offv });
+        }
+    }
+
+    // Parse import_table: count u16, entries (kind u8, nameLen u16, name, refCount u16, refs[section u8, off u64])
+    let mut im_off = 0usize;
+    let mut imports: Vec<ImportSym> = Vec::new();
+    if import_table.len() >= 2 {
+        let count = read_u16_le(&import_table, &mut im_off) as usize;
+        for _ in 0..count {
+            if im_off + 3 > import_table.len() { break; }
+            let kind = import_table[im_off]; im_off += 1;
+            let name_len = read_u16_le(&import_table, &mut im_off) as usize;
+            if im_off + name_len + 2 > import_table.len() { break; }
+            let name = String::from_utf8(import_table[im_off..im_off+name_len].to_vec()).unwrap_or_default(); im_off += name_len;
+            let rcount = read_u16_le(&import_table, &mut im_off) as usize;
+            let mut refs: Vec<ImportRef> = Vec::new();
+            for _ in 0..rcount {
+                if im_off + 1 + 8 > import_table.len() { break; }
+                let section = import_table[im_off]; im_off += 1; let offv = read_u64_le(&import_table, &mut im_off);
+                refs.push(ImportRef { section, offset: offv });
+            }
+            imports.push(ImportSym { kind, name, refs });
+        }
+    }
+
     let mut sizes = HashMap::new();
     sizes.insert("import".into(), import_table.len());
     sizes.insert("locals".into(), local_var_table.len());
@@ -76,7 +124,7 @@ pub fn load(path: &str) -> Result<MASIFile, String> {
     sizes.insert("export".into(), export_table.len());
     sizes.insert("code".into(), code.len());
 
-    Ok(MASIFile { version, entry, label_map: code_offset_to_name, code, section_sizes: sizes, data_label_map: data_offset_to_name, data: data_table })
+    Ok(MASIFile { version, entry, label_map: code_offset_to_name, code, section_sizes: sizes, data_label_map: data_offset_to_name, data: data_table, exports, imports })
 }
 
 fn fmt_op(mode: u8, value: u64, masi: &MASIFile, reg_map_rev: &HashMap<u16, String>) -> String {
@@ -111,7 +159,7 @@ pub fn disassemble(masi: &MASIFile) -> String {
     while pc < code.len() {
         if let Some(name) = masi.label_map.get(&(pc as u64)) { out.push(format!("LBL {}", name)); }
         let opcode = code[pc]; pc += 1;
-        let mut read_op = |pc: &mut usize| -> (u8, u64) { let mode = code[*pc]; *pc += 1; let mut off = *pc; let val = read_u64_le(code, &mut off); *pc = off; (mode, val) };
+    let read_op = |pc: &mut usize| -> (u8, u64) { let mode = code[*pc]; *pc += 1; let mut off = *pc; let val = read_u64_le(code, &mut off); *pc = off; (mode, val) };
         match opcode {
             0x01 => { let d=read_op(&mut pc); let s=read_op(&mut pc); out.push(format!("MOV {} {}", fmt_op(d.0,d.1,masi,&reg_rev), fmt_op(s.0,s.1,masi,&reg_rev))); }
             0x02 => { let d=read_op(&mut pc); let s=read_op(&mut pc); out.push(format!("ADD {} {}", fmt_op(d.0,d.1,masi,&reg_rev), fmt_op(s.0,s.1,masi,&reg_rev))); }
@@ -167,6 +215,17 @@ pub fn dump(masi: &MASIFile) -> String {
         kv.sort_by_key(|(k, _)| *k);
         lines.push("- Labels:".into());
         for (off, name) in kv { lines.push(format!("  - 0x{:X}: {}", off, name)); }
+    }
+    if !masi.exports.is_empty() {
+        lines.push("- Exports:".into());
+        for e in &masi.exports { let k = if e.kind==0 { "code" } else { "data" }; lines.push(format!("  - {} {} @ 0x{:X}", k, e.name, e.offset)); }
+    }
+    if !masi.imports.is_empty() {
+        lines.push("- Imports:".into());
+        for im in &masi.imports {
+            let k = if im.kind==0 { "code" } else { "data" };
+            lines.push(format!("  - {} {} ({} refs)", k, im.name, im.refs.len()));
+        }
     }
     if masi.section_sizes.get("data").copied().unwrap_or(0) > 0 {
         let mut kv: Vec<_> = masi.data_label_map.iter().collect();

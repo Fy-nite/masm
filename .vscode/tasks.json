@@ -4,7 +4,7 @@
 		{
 			"label": "cargo test (masm)",
 			"type": "shell",
-			"command": "cargo",
+			"command": "cd masm ; cargo",
 			"args": [
 				"test"
 			],
