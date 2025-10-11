@@ -10,9 +10,9 @@ IndexResult Indexer::parseText(const QString &text) {
     for (int i = 0; i < lines.size(); ++i) {
         const QString &line = lines[i];
         auto ld = labelDef.match(line);
-        if (ld.hasMatch()) result.definitions.insert(ld.captured(1), i);
+    if (ld.hasMatch()) result.definitions.insert(ld.captured(1).toLower(), i);
         auto ldl = lblDef.match(line);
-        if (ldl.hasMatch()) result.definitions.insert(ldl.captured(1), i);
+    if (ldl.hasMatch()) result.definitions.insert(ldl.captured(1).toLower(), i);
 
         // Find usages (simple word-based)
         QRegularExpression word(R"([A-Za-z_][A-Za-z0-9_\.]*)");
@@ -20,7 +20,7 @@ IndexResult Indexer::parseText(const QString &text) {
         while (it.hasNext()) {
             auto m = it.next();
             QString w = m.captured(0);
-            result.usages.insert(w, i);
+            result.usages.insert(w.toLower(), i);
         }
     }
 

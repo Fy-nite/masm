@@ -20,6 +20,7 @@ private slots:
     void filterByType(int index);
 signals:
     void symbolActivated(int line);
+    void includeRequested(const QString &filename);
 private:
     QLineEdit *m_search{nullptr};
     QComboBox *m_typeFilter{nullptr};

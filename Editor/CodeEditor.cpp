@@ -4,6 +4,9 @@
 #include <QAbstractItemView>
 #include <QScrollBar>
 #include <QKeyEvent>
+#include <QTextCharFormat>
+#include <QTextLayout>
+#include <QVariant>
 
 CodeEditor::CodeEditor(QWidget *parent)
     : QPlainTextEdit(parent) {
@@ -85,7 +88,39 @@ void CodeEditor::highlightCurrentLine() {
     selection.format.setProperty(QTextFormat::FullWidthSelection, true);
     selection.cursor = textCursor();
     selection.cursor.clearSelection();
-    setExtraSelections({ selection });
+    // preserve any diagnostic selections
+    QList<QTextEdit::ExtraSelection> extras;
+    extras.append(selection);
+    // diagnostic extras appended from m_diagnostics
+    for (const Diagnostic &d : m_diagnostics) {
+        if (d.line < 0) continue;
+        QTextBlock b = document()->findBlockByLineNumber(d.line);
+        if (!b.isValid()) continue;
+        QTextCursor c(b);
+        if (d.column >= 0) {
+            int pos = b.position() + d.column;
+            c.setPosition(pos);
+            c.movePosition(QTextCursor::NextCharacter, QTextCursor::KeepAnchor, qMax(1, d.length));
+        } else {
+            c.select(QTextCursor::LineUnderCursor);
+        }
+        QTextEdit::ExtraSelection diagSel;
+        QTextCharFormat fmt;
+        // red underline for Error, orange for Warning
+        if (d.severity.compare("Error", Qt::CaseInsensitive) == 0) {
+            fmt.setUnderlineColor(QColor(220, 50, 50));
+        } else if (d.severity.compare("Warning", Qt::CaseInsensitive) == 0) {
+            fmt.setUnderlineColor(QColor(220, 140, 20));
+        } else {
+            fmt.setUnderlineColor(QColor(120, 120, 120));
+        }
+        fmt.setUnderlineStyle(QTextCharFormat::SpellCheckUnderline);
+        diagSel.format = fmt;
+        diagSel.cursor = c;
+        extras.append(diagSel);
+    }
+
+    setExtraSelections(extras);
 }
 
 void CodeEditor::paintEvent(QPaintEvent *e) {
@@ -116,6 +151,25 @@ void CodeEditor::initCompleter() {
     connect(m_completer, SIGNAL(activated(QString)), this, SLOT(insertCompletion(QString)));
 }
 
+void CodeEditor::autoIndentCurrentLine() {
+    // basic indentation: copy indentation from previous non-empty line
+    QTextCursor c = textCursor();
+    int curLine = c.blockNumber();
+    if (curLine == 0) return;
+    int prev = curLine - 1;
+    while (prev >= 0) {
+        QString line = document()->findBlockByNumber(prev).text();
+        if (!line.trimmed().isEmpty()) {
+            // count leading spaces/tabs
+            int indent = 0;
+            while (indent < line.size() && (line[indent] == ' ' || line[indent] == '\t')) ++indent;
+            c.insertText(QString(indent, ' '));
+            return;
+        }
+        --prev;
+    }
+}
+
 QString CodeEditor::textUnderCursor() const {
     QTextCursor tc = textCursor();
     tc.select(QTextCursor::WordUnderCursor);
@@ -130,8 +184,46 @@ void CodeEditor::insertCompletion(const QString &completion) {
     setTextCursor(tc);
 }
 
+void CodeEditor::setDiagnostics(const QVector<Diagnostic> &diags) {
+    m_diagnostics = diags;
+    // refresh current line highlighting which will include diagnostics
+    highlightCurrentLine();
+}
+
+void CodeEditor::clearDiagnostics() {
+    m_diagnostics.clear();
+    highlightCurrentLine();
+}
+
+void CodeEditor::mouseMoveEvent(QMouseEvent *event) {
+    QPlainTextEdit::mouseMoveEvent(event);
+    QTextCursor c = cursorForPosition(event->pos());
+    int pos = c.position();
+    if (pos == m_lastTooltipPosition) return;
+    m_lastTooltipPosition = pos;
+    // find diagnostic that covers this position
+    for (const Diagnostic &d : m_diagnostics) {
+        if (d.line < 0) continue;
+        QTextBlock b = document()->findBlockByLineNumber(d.line);
+        if (!b.isValid()) continue;
+        int start = b.position() + (d.column >= 0 ? d.column : 0);
+        int end = start + (d.length > 0 ? d.length : b.length());
+        if (pos >= start && pos <= end) {
+            QToolTip::showText(event->globalPos(), d.message, this);
+            return;
+        }
+    }
+    QToolTip::hideText();
+}
+
+void CodeEditor::leaveEvent(QEvent *event) {
+    QPlainTextEdit::leaveEvent(event);
+    QToolTip::hideText();
+}
+
 void CodeEditor::keyPressEvent(QKeyEvent *e) {
-    if (m_completer && m_completer->popup()->isVisible()) {
+    // Handle completion popup if enabled
+    if (m_completer && m_completionsEnabled && m_completer->popup()->isVisible()) {
         switch (e->key()) {
         case Qt::Key_Enter:
         case Qt::Key_Return:
@@ -145,12 +237,20 @@ void CodeEditor::keyPressEvent(QKeyEvent *e) {
         }
     }
 
+    bool wasEnter = (e->key() == Qt::Key_Return || e->key() == Qt::Key_Enter);
     QPlainTextEdit::keyPressEvent(e);
 
-    const bool ctrlOrShift = e->modifiers() & (Qt::ControlModifier | Qt::ShiftModifier);
-    if (!m_completer || (ctrlOrShift && e->text().isEmpty())) return;
+    // Auto-indent after Enter
+    if (wasEnter) {
+        autoIndentCurrentLine();
+    }
 
-    static QString eow = QStringLiteral("~!@#$%^&*()+{}|:\\\\\"<>?,./;'[]-= \t\n");
+    if (!m_completer || !m_completionsEnabled) return;
+
+    const bool ctrlOrShift = e->modifiers() & (Qt::ControlModifier | Qt::ShiftModifier);
+    if (ctrlOrShift && e->text().isEmpty()) return;
+
+            static QString eow = QStringLiteral("~!@#$%^&*()+{}|:<>?,./;'[]-= \t\n");
     bool isShortcut = (e->modifiers() & Qt::ControlModifier) && e->key() == Qt::Key_Space; // Ctrl+Space
     if (!isShortcut) {
         QString completionPrefix = textUnderCursor();

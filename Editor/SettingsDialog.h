@@ -1,25 +1,31 @@
 #pragma once
 #include <QDialog>
-#include <QVBoxLayout>
-#include <QLabel>
-#include <QLineEdit>
-#include <QPushButton>
+
+class QLineEdit;
+class QComboBox;
+class QCheckBox;
 
 class SettingsDialog : public QDialog {
+    Q_OBJECT
 public:
-    SettingsDialog(QWidget *parent = nullptr) : QDialog(parent) {
-        setWindowTitle("Settings");
-        QVBoxLayout *l = new QVBoxLayout(this);
-        l->addWidget(new QLabel("MASM executable path:", this));
-        pathEdit = new QLineEdit(this);
-        l->addWidget(pathEdit);
-        QPushButton *ok = new QPushButton("OK", this);
-        connect(ok, &QPushButton::clicked, this, &SettingsDialog::accept);
-        l->addWidget(ok);
-        setLayout(l);
-    }
-    QString masmPath() const { return pathEdit->text(); }
-    void setMasmPath(const QString &p) { pathEdit->setText(p); }
+    explicit SettingsDialog(QWidget *parent = nullptr);
+    ~SettingsDialog();
+
+    QString masmPath() const;
+    void setMasmPath(const QString &p);
+
+    QString theme() const;
+    void setTheme(const QString &t);
+
+    bool completionsEnabled() const;
+    void setCompletionsEnabled(bool v);
+
+    // load/save helpers
+    void loadSettings();
+    void saveSettings();
+
 private:
-    QLineEdit *pathEdit{nullptr};
+    QLineEdit *m_pathEdit{nullptr};
+    QComboBox *m_theme{nullptr};
+    QCheckBox *m_completions{nullptr};
 };

@@ -1,9 +1,10 @@
 #include "SymbolsViewer.h"
 #include <QRegularExpression>
-#include <QDebug>
 #include <QPushButton>
 #include <QDateTime>
 #include <QCheckBox>
+#include <QTextStream>
+#include "DumpDialog.h"
 
 // Internal representation for symbols
 struct SymbolEntry { QString name; QString type; int line; };
@@ -13,7 +14,7 @@ SymbolsViewer::SymbolsViewer(QWidget *parent)
     m_search = new QLineEdit(this);
     m_search->setPlaceholderText("Search symbols...");
     m_typeFilter = new QComboBox(this);
-    m_typeFilter->addItems({"All", "Label", "Data", "State", "LBL"});
+    m_typeFilter->addItems({"All", "Label", "Data", "State", "LBL", "Macro", "Include"});
     m_tree = new QTreeWidget(this);
     m_tree->setHeaderLabels({"Symbol", "Type"});
     m_tree->setRootIsDecorated(false);
@@ -37,6 +38,13 @@ SymbolsViewer::SymbolsViewer(QWidget *parent)
     connect(m_groupByType, &QCheckBox::toggled, this, &SymbolsViewer::rebuildTree);
 
     connect(m_tree, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem *item, int) {
+        QString type = item->text(1);
+        // If this is an Include entry, try to open the referenced file in the editor
+        if (type == "Include") {
+            QString fname = item->text(0);
+            emit includeRequested(fname);
+            return;
+        }
         bool ok = false;
         int line = item->data(0, Qt::UserRole).toInt(&ok);
         if (ok) emit symbolActivated(line);
@@ -44,26 +52,31 @@ SymbolsViewer::SymbolsViewer(QWidget *parent)
 }
 
 void SymbolsViewer::printContents() {
-    qDebug() << "--- SymbolsViewer verbose dump ---";
-    qDebug() << " timestamp:" << QDateTime::currentDateTime().toString(Qt::ISODate) << " generation:" << m_generation;
-    qDebug() << " m_tree:" << (void*)m_tree << " topLevelCount:" << m_tree->topLevelItemCount();
+    QString dump;
+    QTextStream ss(&dump);
+    ss << "--- SymbolsViewer verbose dump ---\n";
+    ss << " timestamp:" << QDateTime::currentDateTime().toString(Qt::ISODate) << " generation:" << m_generation << "\n";
+    ss << " m_tree:" << (quintptr)m_tree << " topLevelCount:" << m_tree->topLevelItemCount() << "\n";
     for (int i = 0; i < m_tree->topLevelItemCount(); ++i) {
         auto *group = m_tree->topLevelItem(i);
         QString gname = group->text(0);
-        qDebug() << " Group idx=" << i << " ptr=" << (void*)group << " name=" << gname << " childCount=" << group->childCount();
+        ss << " Group idx=" << i << " ptr=" << (quintptr)group << " name=" << gname << " childCount=" << group->childCount() << "\n";
         for (int j = 0; j < group->childCount(); ++j) {
             auto *item = group->child(j);
             QString name = item->text(0);
             QString type = item->text(1);
             int line = item->data(0, Qt::UserRole).toInt();
-            qDebug() << "   childIdx=" << j << " itemPtr=" << (void*)item << " name=" << name << " type=" << type << " line=" << line;
+            ss << "   childIdx=" << j << " itemPtr=" << (quintptr)item << " name=" << name << " type=" << type << " line=" << line << "\n";
             if (!m_lastLines.isEmpty()) {
-                if (line >= 0 && line < m_lastLines.size()) qDebug() << "      source>" << m_lastLines[line];
-                else qDebug() << "      source> (no source line for index)";
+                if (line >= 0 && line < m_lastLines.size()) ss << "      source> " << m_lastLines[line] << "\n";
+                else ss << "      source> (no source line for index)\n";
             }
         }
     }
-    qDebug() << "--- end ---";
+    ss << "--- end ---\n";
+    // show modal dialog with dump
+    DumpDialog dlg(dump, this);
+    dlg.exec();
 }
 
 void SymbolsViewer::applyFilter(const QString &filterText) {
@@ -88,10 +101,12 @@ void SymbolsViewer::updateSymbols(const QString &text) {
     m_lastLines = text.split('\n');
     ++m_generation;
 
-    QRegularExpression labelDef(R"(^\s*([A-Za-z_][A-Za-z0-9_\.]*)\:)");
+    QRegularExpression labelDef(R"(^\s*([A-Za-z_][A-Za-z0-9_\.]*):)");
     QRegularExpression dataDef(R"(^\s*([A-Za-z_][A-Za-z0-9_\.]*)\s+(DB|DW|DD|DQ|DF|DDbl|RESB|RESW|RESD|RESQ|RESF|RESDbl))", QRegularExpression::CaseInsensitiveOption);
     QRegularExpression stateDef(R"(^\s*STATE\s+([A-Za-z_][A-Za-z0-9_\.]*)\b)", QRegularExpression::CaseInsensitiveOption);
     QRegularExpression lblDef(R"((?i)\bLBL\s+([A-Za-z_][A-Za-z0-9_\.]*)\b)");
+    QRegularExpression macroDef(R"((?i)^\s*MACRO\s+([A-Za-z_][A-Za-z0-9_\.]*)\b)");
+    QRegularExpression includeDef(R"((?i)^\s*INCLUDE\s+\"?([^\"\s]+)\"?)");
 
     QStringList lines = text.split('\n');
 
@@ -103,7 +118,9 @@ void SymbolsViewer::updateSymbols(const QString &text) {
         if (t == "LBL") return 4;
         if (t == "Label") return 3;
         if (t == "Data") return 2;
-        if (t == "State") return 1;
+        if (t == "Macro") return 2;
+        if (t == "Include") return 1;
+        if (t == "State") return 0;
         return 0;
     };
 
@@ -149,6 +166,27 @@ void SymbolsViewer::updateSymbols(const QString &text) {
             QString key = name.toLower();
             QString t = "LBL";
             allMatches[key].append({t, i, name});
+        }
+        auto macroMatch = macroDef.match(line);
+        if (macroMatch.hasMatch()) {
+            QString name = macroMatch.captured(1).trimmed();
+            if (seenThisLine.contains(name)) { continue; }
+            seenThisLine.insert(name);
+            if (name.length() < 1) { continue; }
+            QString key = name.toLower();
+            QString t = "Macro";
+            allMatches[key].append({t, i, name});
+        }
+        auto includeMatch = includeDef.match(line);
+        if (includeMatch.hasMatch()) {
+            QString inc = includeMatch.captured(1).trimmed();
+            // use the filename as display/name
+            QString display = inc;
+            QString key = display.toLower();
+            // includes may repeat; allow them but avoid too-short names
+            if (display.length() < 1) continue;
+            QString t = "Include";
+            allMatches[key].append({t, i, display});
         }
     }
     QString filter = m_search->text();
@@ -227,7 +265,7 @@ void SymbolsViewer::updateSymbols(const QString &text) {
     }
 
     // Define the desired group order
-    QStringList groupOrder = {"LBL", "Label", "Data", "State"};
+    QStringList groupOrder = {"LBL", "Label", "Data", "Macro", "Include", "State"};
     for (const QString &gname : groupOrder) {
         if (!buckets.contains(gname)) continue;
         auto vec = buckets[gname];
