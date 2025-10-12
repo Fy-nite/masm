@@ -2,6 +2,8 @@
 
 Welcome to the official repository for MASM (Micro-Assembly), A General Purpose Assembly Language Interpreter with Native Interface (MNI) support.
 
+MASM is designed to be a full replacement for other Micro-Assembly Interpreters like JMASM, CMASM, and others, while providing a more modern and extensible architecture. It supports a good chunk of the MicroV2 instruction set and allows for easy integration with native code through its Module Native Interface (MNI).
+
 ## Features
 - **Cross-Platform**: Runs on Windows, Linux, and macOS.
 - **x86-64 Architecture**: Supports a wide range of x86-64 instructions.
