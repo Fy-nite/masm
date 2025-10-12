@@ -5,6 +5,7 @@ fn read_u16_le(data: &[u8], off: &mut usize) -> u16 { let mut v = 0u16; v |= dat
 fn read_u32_le(data: &[u8], off: &mut usize) -> u32 { let mut v = 0u32; for i in 0..4 { v |= (data[*off + i] as u32) << (8*i); } *off += 4; v }
 fn read_u64_le(data: &[u8], off: &mut usize) -> u64 { let mut v = 0u64; for i in 0..8 { v |= (data[*off + i] as u64) << (8*i); } *off += 8; v }
 
+#[derive(Clone)]
 pub struct MASIFile {
     pub version: u16,
     pub entry: u64,
@@ -27,6 +28,11 @@ pub struct ImportSym { pub kind: u8, pub name: String, pub refs: Vec<ImportRef> 
 
 pub fn load(path: &str) -> Result<MASIFile, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    parse_masi_bytes(&bytes)
+}
+
+/// Parse MASI bytes from a buffer and return the MASIFile structure.
+pub fn parse_masi_bytes(bytes: &[u8]) -> Result<MASIFile, String> {
     if bytes.len() < 16 { return Err("File too small".into()); }
     if &bytes[0..4] != b"MASI" { return Err("Bad magic".into()); }
     let mut off = 4usize;

@@ -9,6 +9,10 @@ macro_rules! debug_println {
 }
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, Sender, Receiver};
+use std::thread::{self, JoinHandle};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 static DEBUG_PRINT: AtomicBool = AtomicBool::new(false);
 
 pub fn set_debug_print(enabled: bool) {
@@ -67,15 +71,30 @@ enum Op {
     Nop  = 0x00,
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct State {
     pub regs: HashMap<u16, u64>,
     pub flags: (bool, bool, bool, bool), // ZF, SF, CF, OF
     pub rip: u64,
     pub stack: Vec<u64>,
-    pub memory: Vec<u8>,
+    // Shared memory buffer between threads. Protected by a mutex for safe concurrent access.
+    pub memory: Arc<Mutex<Vec<u8>>>,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            regs: HashMap::new(),
+            flags: (false, false, false, false),
+            rip: 0,
+            stack: Vec::new(),
+            memory: Arc::new(Mutex::new(Vec::new())),
+            warnings: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
 }
 
 pub struct MniCtx {
@@ -144,20 +163,74 @@ impl ModuleRegistry {
     }
 }
 
+// Thread registry for spawned VM threads
+struct ThreadEntry {
+    handle: JoinHandle<()>,
+}
+
+struct ThreadRegistry {
+    map: Mutex<std::collections::HashMap<u64, ThreadEntry>>,
+    next_id: AtomicU64,
+}
+
+impl ThreadRegistry {
+    fn new() -> Self {
+        Self { map: Mutex::new(HashMap::new()), next_id: AtomicU64::new(1) }
+    }
+    fn insert(&self, entry: ThreadEntry) -> u64 {
+        let id = self.next_id.fetch_add(1, AtomicOrdering::SeqCst);
+        let mut m = self.map.lock().unwrap();
+        m.insert(id, entry);
+        id
+    }
+    fn remove(&self, id: u64) -> Option<ThreadEntry> {
+        let mut m = self.map.lock().unwrap();
+        m.remove(&id)
+    }
+}
+
+// Simple allocation registry to track allocations (base -> size)
+struct AllocRegistry {
+    map: Mutex<std::collections::HashMap<usize, usize>>,
+}
+
+impl AllocRegistry {
+    fn new() -> Self { Self { map: Mutex::new(HashMap::new()) } }
+    fn insert(&self, base: usize, size: usize) { let mut m = self.map.lock().unwrap(); m.insert(base, size); }
+    fn remove(&self, base: usize) -> Option<usize> { let mut m = self.map.lock().unwrap(); m.remove(&base) }
+    fn get(&self, base: usize) -> Option<usize> { let m = self.map.lock().unwrap(); m.get(&base).copied() }
+}
+
+
 fn read_u16_le(data: &[u8], off: &mut usize) -> u16 { let mut v=0u16; v |= data[*off] as u16; v |= (data[*off+1] as u16) << 8; *off+=2; v }
 fn read_u64_le(data: &[u8], off: &mut usize) -> u64 { let mut v=0u64; for i in 0..8 { v |= (data[*off+i] as u64) << (8*i); } *off+=8; v }
 
 fn read_u64_from_memory(addr: u64, state: &State) -> u64 {
     let a = addr as usize;
-    if a >= state.memory.len() { return 0; }
+    let mem = state.memory.lock().unwrap();
+    if a >= mem.len() { return 0; }
     let end = a.saturating_add(8);
-    if end > state.memory.len() { return 0; }
-    let mut v = 0u64; for i in 0..8 { v |= (state.memory[a+i] as u64) << (8*i); } v
+    if end > mem.len() { return 0; }
+    let mut v = 0u64;
+    for i in 0..8 { v |= (mem[a+i] as u64) << (8*i); }
+    v
 }
+
 fn write_u64_to_memory(addr: u64, value: u64, state: &mut State) {
     let a = addr as usize; if a > usize::MAX - 8 { return; }
-    if state.memory.len() < a + 8 { state.memory.resize(a + 8, 0); }
-    let mut v = value; for i in 0..8 { state.memory[a+i] = (v & 0xFF) as u8; v >>= 8; }
+    let mut mem = state.memory.lock().unwrap();
+    if mem.len() < a + 8 { mem.resize(a + 8, 0); }
+    let mut v = value; for i in 0..8 { mem[a+i] = (v & 0xFF) as u8; v >>= 8; }
+}
+
+// Helper: read a C-style NUL-terminated string from shared memory
+fn read_c_string(addr: u64, state: &State) -> Option<String> {
+    let start = addr as usize;
+    let mem = state.memory.lock().unwrap();
+    if start >= mem.len() { return None; }
+    let mut i = start; let mut bytes: Vec<u8> = Vec::new();
+    while i < mem.len() { let b = mem[i]; i += 1; if b == 0 { break; } bytes.push(b); }
+    String::from_utf8(bytes).ok()
 }
 
 // -------- MNI C-ABI host context (optional, for native libraries) --------
@@ -188,8 +261,11 @@ extern "C" fn host_write_u64(ctx: *mut MniVmCtx, addr: u64, value: u64) {
         let s = &mut *( (*ctx).user_data as *mut State );
         write_u64_to_memory(addr, value, s);
         // update pointers after potential resize
-        (*ctx).memory_ptr = s.memory.as_mut_ptr();
-        (*ctx).memory_len = s.memory.len();
+        {
+            let mem = s.memory.lock().unwrap();
+            (*ctx).memory_ptr = mem.as_ptr() as *mut u8;
+            (*ctx).memory_len = mem.len();
+        }
     }
 }
 
@@ -223,15 +299,21 @@ fn get_operand(code: &[u8], pc: &mut usize, state: &mut State) -> u64 {
         2 => val,
         3 => {
             let a = val as usize;
-            if a >= state.memory.len() || a.saturating_add(8) > state.memory.len() {
-                state.warnings.push(format!("read_u64 OOB at 0x{:X} (mem size {})", a, state.memory.len()));
+            {
+                let mem = state.memory.lock().unwrap();
+                if a >= mem.len() || a.saturating_add(8) > mem.len() {
+                    state.warnings.push(format!("read_u64 OOB at 0x{:X} (mem size {})", a, mem.len()));
+                }
             }
             read_u64_from_memory(val, state)
         }
         4 => {
             let id = val as u16; let addr = *state.regs.get(&id).unwrap_or(&0); let a = addr as usize;
-            if a >= state.memory.len() || a.saturating_add(8) > state.memory.len() {
-                state.warnings.push(format!("read_u64 OOB at 0x{:X} (mem size {})", a, state.memory.len()));
+            {
+                let mem = state.memory.lock().unwrap();
+                if a >= mem.len() || a.saturating_add(8) > mem.len() {
+                    state.warnings.push(format!("read_u64 OOB at 0x{:X} (mem size {})", a, mem.len()));
+                }
             }
             read_u64_from_memory(addr, state)
         },
@@ -262,12 +344,8 @@ fn update_sub_flags(a: u64, b: u64, r: u64, state: &mut State) {
     state.flags = (zf, sf, cf, of);
 }
 
-fn read_c_string(addr: u64, mem: &[u8]) -> Option<String> {
-    let start = addr as usize; if start >= mem.len() { return None; }
-    let mut i = start; let mut bytes: Vec<u8> = Vec::new();
-    while i < mem.len() { let b = mem[i]; i += 1; if b == 0 { break; } bytes.push(b); }
-    String::from_utf8(bytes).ok()
-}
+// Note: read_c_string previously accepted a slice; with shared memory we read under a lock.
+// Use the version defined earlier that takes (&State).
 
 fn load_lua_modules(registry: &mut ModuleRegistry) -> Result<(), String> {
     let modules_dir = Path::new("modules");
@@ -322,14 +400,40 @@ fn load_lua_modules(registry: &mut ModuleRegistry) -> Result<(), String> {
                                 LuaValue::Table(t) => {
                                     if let Ok(Some(out)) = t.get::<Option<String>>("out") { println!("{}", out); }
                                     if let Ok(Some(upd)) = t.get::<Option<LuaTable>>("regs") {
-                                        for pair in upd.pairs::<String, i64>() { if let Ok((rname, ival)) = pair { if let Some(id) = RegisterMap::build_name_to_id().get(&rname) { ctx.state.regs.insert(*id, ival as u64); } } }
+                                        for pair in upd.pairs::<String, i64>() {
+                                            if let Ok((rname, ival)) = pair {
+                                                if let Some(id) = RegisterMap::build_name_to_id().get(&rname) {
+                                                    ctx.state.regs.insert(*id, ival as u64);
+                                                }
+                                            }
+                                        }
                                     }
                                     if let Ok(Some(store)) = t.get::<Option<LuaTable>>("store") {
                                         let mut dest: Option<u64> = None;
                                         if let Ok(Some(addr)) = store.get::<Option<u64>>("addr") { dest = Some(addr); }
-                                        else if let Ok(Some(rname)) = store.get::<Option<String>>("reg") { if let Some(id) = RegisterMap::build_name_to_id().get(&rname) { dest = Some(*ctx.state.regs.get(id).unwrap_or(&0)); } }
-                                        if let Some(base) = dest { let base_usize = base as usize; if let Ok(Some(s)) = store.get::<Option<String>>("string") { let mut bytes = s.into_bytes(); bytes.push(0); if ctx.state.memory.len() < base_usize + bytes.len() { ctx.state.memory.resize(base_usize + bytes.len(), 0); } ctx.state.memory[base_usize..base_usize+bytes.len()].copy_from_slice(&bytes); }
-                                        else if let Ok(Some(arr)) = store.get::<Option<LuaTable>>("bytes") { let len = arr.len().unwrap_or(0) as usize; let mut bytes: Vec<u8> = Vec::with_capacity(len); for i in 1..=len { if let Ok(v) = arr.get::<i64>(i as i64) { bytes.push(v as u8); } } if ctx.state.memory.len() < base_usize + bytes.len() { ctx.state.memory.resize(base_usize + bytes.len(), 0); } ctx.state.memory[base_usize..base_usize+bytes.len()].copy_from_slice(&bytes); } }
+                                        else if let Ok(Some(rname)) = store.get::<Option<String>>("reg") {
+                                            if let Some(id) = RegisterMap::build_name_to_id().get(&rname) {
+                                                dest = Some(*ctx.state.regs.get(id).unwrap_or(&0));
+                                            }
+                                        }
+                                        if let Some(base) = dest {
+                                            let base_usize = base as usize;
+                                            if let Ok(Some(s)) = store.get::<Option<String>>("string") {
+                                                let mut bytes = s.into_bytes(); bytes.push(0);
+                                                let mut mem = ctx.state.memory.lock().unwrap();
+                                                if mem.len() < base_usize + bytes.len() { mem.resize(base_usize + bytes.len(), 0); }
+                                                mem[base_usize..base_usize+bytes.len()].copy_from_slice(&bytes);
+                                            } else if let Ok(Some(arr)) = store.get::<Option<LuaTable>>("bytes") {
+                                                let len = arr.len().unwrap_or(0) as usize;
+                                                let mut bytes: Vec<u8> = Vec::with_capacity(len);
+                                                for i in 1..=len {
+                                                    if let Ok(v) = arr.get::<i64>(i as i64) { bytes.push(v as u8); }
+                                                }
+                                                let mut mem = ctx.state.memory.lock().unwrap();
+                                                if mem.len() < base_usize + bytes.len() { mem.resize(base_usize + bytes.len(), 0); }
+                                                mem[base_usize..base_usize+bytes.len()].copy_from_slice(&bytes);
+                                            }
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -346,6 +450,25 @@ fn load_lua_modules(registry: &mut ModuleRegistry) -> Result<(), String> {
 pub fn run_path(path: &str) -> Result<(), String> {
     let masi = disassembler::load(path)?;
     run_masi(&masi)
+}
+
+/// Run MASI directly from a byte buffer.
+pub fn run_masi_from_bytes(buf: &[u8]) -> Result<State, String> {
+    let masi = disassembler::parse_masi_bytes(buf)?;
+    // use default IO runner
+    let _ = run_masi(&masi)?;
+    // run_masi returns Result<(),String> so call run_masi_with_io to get State
+    let mut out = io::stdout();
+    let mut err = io::stderr();
+    let mut stdin_lock = io::stdin().lock();
+    run_masi_with_io(&masi, &mut out, &mut err, Some(&mut stdin_lock))
+}
+
+/// Compile a MASM source string into MASI bytes. This is a stub; the assembler is not implemented here.
+pub fn compile_source_to_masi_bytes(_src: &str) -> Result<Vec<u8>, String> {
+    // Forward to the assembler implementation in this crate.
+    // This returns MASI file bytes that can be parsed by `disassembler::parse_masi_bytes` or written to disk.
+    crate::assembler::assemble_to_masi(_src)
 }
 
 pub fn run_masi(masi: &MASIFile) -> Result<(), String> {
@@ -369,26 +492,32 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
     mut input: Option<&mut R>,
 ) -> Result<State, String> {
     let mut state = State::default();
-    state.memory = masi.data.clone();
+    // initialize shared memory from MASI data
+    state.memory = Arc::new(Mutex::new(masi.data.clone()));
     let mut registry = ModuleRegistry::new();
-    // // debug.echo: prints C-string at RDI
-    // let name_to_id = RegisterMap::build_name_to_id();
-    // let rdi = *name_to_id.get("RDI").unwrap_or(&0);
-    // registry.register("debug", "echo", move |ctx: &mut MniCtx| {
-    //     let ptr = *ctx.state.regs.get(&rdi).unwrap_or(&0);
-    //     if let Some(s) = read_c_string(ptr, &ctx.state.memory) { println!("{}", s); }
-    // });
-    // // tool.set_rax <value>: sets RAX to the provided integer string
-    // let name_to_id2 = RegisterMap::build_name_to_id();
-    // let rax = *name_to_id2.get("RAX").unwrap_or(&0);
-    // // registry.register("tool", "set_rax", move |ctx: &mut MniCtx| {
-    // //     if let Some(first) = ctx.args.get(0) {
-    // //         if let Ok(v) = first.parse::<u64>() { ctx.state.regs.insert(rax, v); }
-    // //     }
-    // // });
+    
+
 
     // Built-in Rust MNI shims
     {
+        // Thread registry (shared for MNI functions)
+        use std::sync::Once;
+        static mut THREAD_REGISTRY_PTR: *const ThreadRegistry = 0 as *const ThreadRegistry;
+        static THREAD_REGISTRY_INIT: Once = Once::new();
+        THREAD_REGISTRY_INIT.call_once(|| {
+            let reg = Box::new(ThreadRegistry::new());
+            unsafe { THREAD_REGISTRY_PTR = Box::into_raw(reg); }
+        });
+        let thread_registry: &'static ThreadRegistry = unsafe { &*THREAD_REGISTRY_PTR };
+        // Allocation registry (shared for memory bookkeeping)
+        static mut ALLOC_REGISTRY_PTR: *const AllocRegistry = 0 as *const AllocRegistry;
+        static ALLOC_REGISTRY_INIT: Once = Once::new();
+        ALLOC_REGISTRY_INIT.call_once(|| {
+            let reg = Box::new(AllocRegistry::new());
+            unsafe { ALLOC_REGISTRY_PTR = Box::into_raw(reg); }
+        });
+        let alloc_registry: &'static AllocRegistry = unsafe { &*ALLOC_REGISTRY_PTR };
+
         // tool.set_rax already exists via Lua examples, but provide a basic Rust one if not provided by Lua
         let nm = RegisterMap::build_name_to_id();
         let rax = *nm.get("RAX").unwrap_or(&0);
@@ -399,17 +528,32 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
         });
         // Memory.allocate size -> R1
         let r1 = *nm.get("R1").unwrap_or(&0);
-        registry.register("Memory", "allocate", move |ctx: &mut MniCtx| {
-            if let Some(sz_s) = ctx.args.get(0) {
-                if let Ok(sz) = sz_s.parse::<usize>() {
-                    let base = ctx.state.memory.len();
-                    ctx.state.memory.resize(base + sz, 0);
-                    ctx.state.regs.insert(r1, base as u64);
+        {
+            let alloc_registry = alloc_registry;
+            registry.register("Memory", "allocate", move |ctx: &mut MniCtx| {
+                if let Some(sz_s) = ctx.args.get(0) {
+                    if let Ok(sz) = sz_s.parse::<usize>() {
+                        let mut mem = ctx.state.memory.lock().unwrap();
+                        let base = mem.len();
+                        mem.resize(base + sz, 0);
+                        alloc_registry.insert(base, sz);
+                        ctx.state.regs.insert(r1, base as u64);
+                    }
                 }
-            }
-        });
+            });
+        }
         // Memory.free ptr (no-op in simple flat memory model)
-        registry.register("Memory", "free", move |_ctx: &mut MniCtx| { /* no-op */ });
+        {
+            let alloc_registry = alloc_registry;
+            registry.register("Memory", "free", move |ctx: &mut MniCtx| {
+                if let Some(ptr_s) = ctx.args.get(0) {
+                    if let Ok(ptr) = ptr_s.parse::<usize>() {
+                        // remove allocation bookkeeping if present
+                        alloc_registry.remove(ptr);
+                    }
+                }
+            });
+        }
         // Math.sqrt in-place: Math.sqrt src_fpr dest_fpr (by names)
         registry.register("Math", "sqrt", move |ctx: &mut MniCtx| {
             if ctx.args.len() >= 2 {
@@ -422,6 +566,136 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
                 }
             }
         });
+        // Memory.write_bytes dest_addr src_label -> writes NUL-terminated string into memory at dest_addr, returns bytes written in RAX
+        {
+            let rax = *nm.get("RAX").unwrap_or(&0);
+            let alloc_registry = alloc_registry;
+            registry.register("Memory", "write_bytes", move |ctx: &mut MniCtx| {
+                if ctx.args.len() >= 2 {
+                    if let (Ok(dest), src) = (ctx.args[0].parse::<usize>(), &ctx.args[1]) {
+                        // src is usually a string value passed by the assembler; try to write it with NUL
+                        let mut bytes = src.as_bytes().to_vec(); bytes.push(0);
+                        let mut mem = ctx.state.memory.lock().unwrap();
+                        if dest + bytes.len() > mem.len() { mem.resize(dest + bytes.len(), 0); }
+                        mem[dest..dest+bytes.len()].copy_from_slice(&bytes);
+                        ctx.state.regs.insert(rax, bytes.len() as u64);
+                        // record allocation if it matches end of heap
+                        alloc_registry.insert(dest, bytes.len());
+                    }
+                }
+            });
+        }
+
+        // Memory.realloc ptr new_size -> returns new_ptr in RAX or error (u64::MAX)
+        {
+            let rax = *nm.get("RAX").unwrap_or(&0);
+            let alloc_registry = alloc_registry;
+            registry.register("Memory", "realloc", move |ctx: &mut MniCtx| {
+                if ctx.args.len() >= 2 {
+                    if let (Ok(ptr), Ok(new_sz)) = (ctx.args[0].parse::<usize>(), ctx.args[1].parse::<usize>()) {
+                        // locate old size
+                        if let Some(old_sz) = alloc_registry.get(ptr) {
+                            let mut mem = ctx.state.memory.lock().unwrap();
+                            // naive realloc: if ptr is end of heap, extend or shrink in-place
+                            if ptr + old_sz == mem.len() {
+                                if new_sz <= old_sz {
+                                    mem.truncate(ptr + new_sz);
+                                    alloc_registry.insert(ptr, new_sz);
+                                    ctx.state.regs.insert(rax, ptr as u64);
+                                    return;
+                                } else {
+                                    mem.resize(ptr + new_sz, 0);
+                                    alloc_registry.insert(ptr, new_sz);
+                                    ctx.state.regs.insert(rax, ptr as u64);
+                                    return;
+                                }
+                            } else {
+                                // otherwise allocate new block at end and copy
+                                let base = mem.len();
+                                let copy_len = std::cmp::min(old_sz, new_sz);
+                                // copy source bytes into temp buffer before resizing to avoid
+                                // simultaneous immutable/mutable borrows of `mem`
+                                let temp: Vec<u8> = mem[ptr..ptr+copy_len].to_vec();
+                                mem.resize(base + new_sz, 0);
+                                mem[base..base+copy_len].copy_from_slice(&temp);
+                                alloc_registry.insert(base, new_sz);
+                                alloc_registry.remove(ptr);
+                                ctx.state.regs.insert(rax, base as u64);
+                                return;
+                            }
+                        }
+                    }
+                }
+                ctx.state.regs.insert(rax, u64::MAX);
+            });
+        }
+        
+
+        // Thread.spawn: args = [label_addr (numeric) , optional: arg_addr (c-string address)] -> returns thread id in RAX
+        {
+            let thread_registry = thread_registry;
+            let masi_arc = Arc::new(masi.clone());
+            registry.register("Thread", "spawn", move |ctx: &mut MniCtx| {
+                // parse label address
+                if let Some(first) = ctx.args.get(0) {
+                    if let Ok(label) = first.parse::<u64>() {
+                        // clone state but share memory and code
+                        let mut child_state = State::default();
+                        child_state.memory = ctx.state.memory.clone();
+                        child_state.regs = ctx.state.regs.clone();
+                        child_state.rip = label as u64;
+                        // spawn thread that runs until halt
+                        let masi_for_thread = masi_arc.clone();
+                        let handle = thread::spawn(move || {
+                            // run the MASI using the default IO runner; discard result
+                            let _ = run_masi(&*masi_for_thread);
+                        });
+                        let entry = ThreadEntry { handle };
+                        let id = thread_registry.insert(entry);
+                        // place id into RAX
+                        let rax = *RegisterMap::build_name_to_id().get("RAX").unwrap_or(&0);
+                        ctx.state.regs.insert(rax, id);
+                    }
+                }
+            });
+        }
+
+        // Thread.join: args = [thread_id] -> returns 0 on success, -1 on error
+        {
+            let thread_registry = thread_registry;
+            registry.register("Thread", "join", move |ctx: &mut MniCtx| {
+                if let Some(first) = ctx.args.get(0) {
+                    if let Ok(id) = first.parse::<u64>() {
+                        if let Some(entry) = thread_registry.remove(id) {
+                            let _ = entry.handle.join();
+                            let rax = *RegisterMap::build_name_to_id().get("RAX").unwrap_or(&0);
+                            ctx.state.regs.insert(rax, 0);
+                            return;
+                        }
+                    }
+                }
+                let rax = *RegisterMap::build_name_to_id().get("RAX").unwrap_or(&0);
+                ctx.state.regs.insert(rax, u64::MAX);
+            });
+        }
+
+        // Thread.detach: args = [thread_id] -> returns 0 on success, -1 on error
+        {
+            let thread_registry = thread_registry;
+            registry.register("Thread", "detach", move |ctx: &mut MniCtx| {
+                if let Some(first) = ctx.args.get(0) {
+                    if let Ok(id) = first.parse::<u64>() {
+                        if thread_registry.remove(id).is_some() {
+                            let rax = *RegisterMap::build_name_to_id().get("RAX").unwrap_or(&0);
+                            ctx.state.regs.insert(rax, 0);
+                            return;
+                        }
+                    }
+                }
+                let rax = *RegisterMap::build_name_to_id().get("RAX").unwrap_or(&0);
+                ctx.state.regs.insert(rax, u64::MAX);
+            });
+        }
     }
 
     // Load Lua modules if present
@@ -580,14 +854,14 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
                     match mode {
                         0 => argv.push(format!("{}", val)),
                         1 => { let id = val as u16; let name = RegisterMap::build_id_to_name().remove(&id).unwrap_or_else(|| format!("REG{}", id)); argv.push(name); }
-                        3 => { if let Some(s) = read_c_string(val, &state.memory) { argv.push(s); } else { argv.push(format!("$0x{:X}", val)); } }
+                        3 => { if let Some(s) = read_c_string(val, &state) { argv.push(s); } else { argv.push(format!("$0x{:X}", val)); } }
                         4 => { let id = val as u16; let name = RegisterMap::build_id_to_name().remove(&id).unwrap_or_else(|| format!("REG{}", id)); argv.push(format!("${}", name)); }
                         _ => argv.push(format!("{}", val)),
                     }
                 }
                 // Decode module/function names
-                let mod_name = match m_mode { 3 => read_c_string(m_val, &state.memory), 1 => Some(RegisterMap::build_id_to_name().remove(&(m_val as u16)).unwrap_or_else(|| format!("REG{}", m_val as u16))), 0 => Some(format!("{}", m_val)), 4 => Some(format!("${}", RegisterMap::build_id_to_name().remove(&(m_val as u16)).unwrap_or_else(|| format!("REG{}", m_val as u16)))), _ => None };
-                let fn_name  = match f_mode { 3 => read_c_string(f_val, &state.memory), 1 => Some(RegisterMap::build_id_to_name().remove(&(f_val as u16)).unwrap_or_else(|| format!("REG{}", f_val as u16))), 0 => Some(format!("{}", f_val)), 4 => Some(format!("${}", RegisterMap::build_id_to_name().remove(&(f_val as u16)).unwrap_or_else(|| format!("REG{}", f_val as u16)))), _ => None };
+                let mod_name = match m_mode { 3 => read_c_string(m_val, &state), 1 => Some(RegisterMap::build_id_to_name().remove(&(m_val as u16)).unwrap_or_else(|| format!("REG{}", m_val as u16))), 0 => Some(format!("{}", m_val)), 4 => Some(format!("${}", RegisterMap::build_id_to_name().remove(&(m_val as u16)).unwrap_or_else(|| format!("REG{}", m_val as u16)))), _ => None };
+                let fn_name  = match f_mode { 3 => read_c_string(f_val, &state), 1 => Some(RegisterMap::build_id_to_name().remove(&(f_val as u16)).unwrap_or_else(|| format!("REG{}", f_val as u16))), 0 => Some(format!("{}", f_val)), 4 => Some(format!("${}", RegisterMap::build_id_to_name().remove(&(f_val as u16)).unwrap_or_else(|| format!("REG{}", f_val as u16)))), _ => None };
                 debug_println!("[DEBUG] MNI lookup: module={:?}, function={:?}", mod_name, fn_name);
                 debug_println!("[DEBUG] Registered MNI functions (omitted in normal run)");
                 if let (Some(mn), Some(fn_)) = (mod_name, fn_name) {
@@ -629,11 +903,12 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
                                     let mut ptrs: Vec<*const c_char> = c_args.iter().map(|s| s.as_ptr()).collect();
                                     ptrs.push(std::ptr::null());
                                     // Prepare VM context
+                                    // Do not expose raw memory pointer; native modules should call host_read_u64/host_write_u64
                                     let mut vm_ctx = MniVmCtx {
                                         api_version: 1,
                                         user_data: (&mut state as *mut State).cast(),
-                                        memory_ptr: state.memory.as_mut_ptr(),
-                                        memory_len: state.memory.len(),
+                                        memory_ptr: std::ptr::null_mut(),
+                                        memory_len: 0,
                                         read_u64: host_read_u64,
                                         write_u64: host_write_u64,
                                         get_reg_by_name: host_get_reg_by_name,
@@ -711,11 +986,15 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
                         let fd = a1;
                         let buf = a2 as usize;
                         let cnt = a3 as usize;
-                        let end = buf.saturating_add(cnt).min(state.memory.len());
-                        let slice = if buf < end { &state.memory[buf..end] } else { &[] };
-                        if fd == 1 { let _ = out.write_all(slice); let _ = out.flush(); }
-                        else if fd == 2 { let _ = err.write_all(slice); let _ = err.flush(); }
-                        state.regs.insert(rax, slice.len() as u64);
+                        // copy bytes out of locked memory then write without holding lock
+                        let slice_vec = {
+                            let mem = state.memory.lock().unwrap();
+                            let end = buf.saturating_add(cnt).min(mem.len());
+                            if buf < end { mem[buf..end].to_vec() } else { Vec::new() }
+                        };
+                        if fd == 1 { let _ = out.write_all(&slice_vec); let _ = out.flush(); }
+                        else if fd == 2 { let _ = err.write_all(&slice_vec); let _ = err.flush(); }
+                        state.regs.insert(rax, slice_vec.len() as u64);
                     }
                     0 => { // read(fd, buf, count) - only stdin supported
                         let fd = a1; let buf = a2 as usize; let cnt = a3 as usize;
@@ -724,8 +1003,11 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
                             match input.as_deref_mut() { Some(r) => { let _ = r.read_line(&mut s); }, None => { let _ = io::stdin().read_line(&mut s); } }
                             let mut bytes = s.into_bytes();
                             if bytes.len() > cnt { bytes.truncate(cnt); }
-                            if buf + bytes.len() > state.memory.len() { state.memory.resize(buf + bytes.len(), 0); }
-                            state.memory[buf..buf+bytes.len()].copy_from_slice(&bytes);
+                            {
+                                let mut mem = state.memory.lock().unwrap();
+                                if buf + bytes.len() > mem.len() { mem.resize(buf + bytes.len(), 0); }
+                                mem[buf..buf+bytes.len()].copy_from_slice(&bytes);
+                            }
                             state.regs.insert(rax, bytes.len() as u64);
                         } else { state.regs.insert(rax, 0); }
                     }
@@ -743,7 +1025,7 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
                 let w: &mut dyn Write = if to_err { err as &mut dyn Write } else { out as &mut dyn Write };
                 match val_mode {
                     3 | 4 => {
-                        if let Some(s) = read_c_string(val_val, &state.memory) {
+                        if let Some(s) = read_c_string(val_val, &state) {
                             let _ = writeln!(w, "{}", s);
                         } else {
                             let _ = writeln!(w, "{}", val_val);
@@ -762,7 +1044,10 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
                 let p = get_operand(code, &mut pc, &mut state);
                 let v = get_operand(code, &mut pc, &mut state);
                 let to_err = p == 2;
-                let ch: u8 = if (v as usize) < state.memory.len() { state.memory[v as usize] } else { v as u8 };
+                let ch: u8 = {
+                    let mem = state.memory.lock().unwrap();
+                    if (v as usize) < mem.len() { mem[v as usize] } else { v as u8 }
+                };
                 if to_err { let _ = err.write_all(&[ch]); let _ = err.flush(); } else { let _ = out.write_all(&[ch]); let _ = out.flush(); }
             }
             x if x == Op::In as u8 => {
@@ -777,8 +1062,11 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
                     }
                 }
                 let mut bytes = line.into_bytes(); bytes.push(0);
-                if dest_addr + bytes.len() > state.memory.len() { state.memory.resize(dest_addr + bytes.len(), 0); }
-                state.memory[dest_addr..dest_addr+bytes.len()].copy_from_slice(&bytes);
+                {
+                    let mut mem = state.memory.lock().unwrap();
+                    if dest_addr + bytes.len() > mem.len() { mem.resize(dest_addr + bytes.len(), 0); }
+                    mem[dest_addr..dest_addr+bytes.len()].copy_from_slice(&bytes);
+                }
             }
             _ => {}
         }
