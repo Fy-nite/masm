@@ -1,24 +1,43 @@
-#include <QApplication>
-#include <Qsci/qsciscintilla.h>
-#include <Qsci/qscilexercpp.h>
-#include <QWidget>
-#include <QVBoxLayout>
+# MASM
 
-int main(int argc, char *argv[]) {
-    QApplication app(argc, argv);
+Welcome to the official repository for MASM (Micro-Assembly), A General Purpose Assembly Language Interpreter with Native Interface (MNI) support.
 
-    QWidget window;
-    QVBoxLayout layout(&window);
+## Features
+- **Cross-Platform**: Runs on Windows, Linux, and macOS.
+- **x86-64 Architecture**: Supports a wide range of x86-64 instructions.
+- **Module Native Interface (MNI)**: Call native code in host languages like Java, C#, C, C++, Rust, Go, etc.
+- **Extensible**: Easily add new modules and functions.
+- **Threading Support**: Create and manage threads within MASM programs.
+- **Memory Management**: Allocate, reallocate, and free memory dynamically.
+- **Standard I/O**: Read from stdin and write to stdout/stderr.
+- **Comprehensive Documentation**: Detailed guides and API references.
+- **Example Modules**: Pre-built modules for common tasks.
+- **Test Suite**: Ensure reliability with a suite of tests.
+- **Open Source**: Free to use and modify under the AGPL License.
 
-    QsciScintilla *editor = new QsciScintilla();
-    QsciLexerCPP *lexer = new QsciLexerCPP();
-    editor->setLexer(lexer);
-    editor->setUtf8(true);
-
-    layout.addWidget(editor);
-    window.setWindowTitle("Simple C++ Code Editor");
-    window.resize(800, 600);
-    window.show();
-
-    return app.exec();
-}
+## Getting Started
+1. **Clone the Repository**:
+   ```bash
+   git clone https://github.com/charlie-sans/masm.git
+   cd masm
+    ```
+2. **Build the Project**:
+    ```bash
+    cargo build --release
+    ```
+3. **Run the Interpreter**:
+    ```bash
+    ./target/release/masm path/to/your/file.masm -o <output>.masi
+    ./target/release/masm path/to/your/file.masi
+    ```
+4. **Explore Example Modules**: Check out the `masm/modules` directory for example modules like `GUI.lua`.
+5. **Write Your Own MASM Programs**: Use the provided examples and documentation to create your own MASM programs.
+6. **Run Tests**: Ensure everything is working by running the test suite.
+    ```bash
+    cargo test
+    ```
+## Documentation
+- [User Guide](masm/docs/user_guide.md)
+- [API Reference](masm/docs/api_reference.md)
+- [Module Development](masm/docs/module_development.md)
+- [Assembly Language Reference](masm/docs/MicroV2.md)
