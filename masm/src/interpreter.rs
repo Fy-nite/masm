@@ -10,7 +10,7 @@ macro_rules! debug_println {
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{channel, Sender, Receiver};
+// removed unused std::sync::mpsc imports
 use std::thread::{self, JoinHandle};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 static DEBUG_PRINT: AtomicBool = AtomicBool::new(false);
@@ -28,6 +28,8 @@ use mlua::{Lua, Value as LuaValue, Table as LuaTable, Function as LuaFunction};
 use std::ffi::{CString, CStr};
 use std::os::raw::{c_char, c_void};
 use libloading::Library;
+use std::cell::RefCell;
+use std::collections::HashSet;
 
 #[repr(u8)]
 enum Op {
@@ -95,6 +97,34 @@ impl Default for State {
             errors: Vec::new(),
         }
     }
+}
+
+// ---------------- Debugger support (optional) ----------------
+// A simple hook the VM calls before each instruction. Implementations can block to run a REPL,
+// decide stepping/continuation, and request exit.
+pub enum DebuggerControl { Continue, Exit }
+
+pub trait Debugger {
+    fn before_execute(&mut self, masi: &MASIFile, state: &State, pc: usize, opcode: u8) -> DebuggerControl;
+}
+
+thread_local! {
+    static TLS_DEBUGGER: RefCell<Option<Box<dyn Debugger>>> = RefCell::new(None);
+}
+
+/// Install/uninstall a debugger for the current thread. Call this before run_masi/run_masi_with_io.
+pub fn set_thread_debugger(dbg: Option<Box<dyn Debugger>>) {
+    TLS_DEBUGGER.with(|cell| {
+        *cell.borrow_mut() = dbg;
+    });
+}
+
+fn with_debugger<F: FnOnce(&mut dyn Debugger) -> DebuggerControl>(f: F) -> Option<DebuggerControl> {
+    TLS_DEBUGGER.with(|cell| {
+        if let Some(ref mut d) = *cell.borrow_mut() {
+            Some(f(d.as_mut()))
+        } else { None }
+    })
 }
 
 pub struct MniCtx {
@@ -705,7 +735,12 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
     let mut pc: usize = masi.entry as usize;
     while pc < code.len() {
         state.rip = pc as u64;
-        let byte = code[pc]; pc += 1;
+        let opcode = code[pc];
+        // Debugger hook: allow debugger to pause/step/exit before executing this instruction
+        if let Some(ctrl) = with_debugger(|d| d.before_execute(masi, &state, pc, opcode)) {
+            match ctrl { DebuggerControl::Continue => {}, DebuggerControl::Exit => { return Ok(state); } }
+        }
+        let byte = opcode; pc += 1;
         match byte {
             x if x == Op::Nop as u8 => { continue; }
             x if x == Op::Hlt as u8 => { return Ok(state); }
@@ -1003,12 +1038,16 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
                             match input.as_deref_mut() { Some(r) => { let _ = r.read_line(&mut s); }, None => { let _ = io::stdin().read_line(&mut s); } }
                             let mut bytes = s.into_bytes();
                             if bytes.len() > cnt { bytes.truncate(cnt); }
+                            // Mirror IN semantics: append a NUL terminator and auto-resize memory to fit
+                            bytes.push(0);
                             {
                                 let mut mem = state.memory.lock().unwrap();
-                                if buf + bytes.len() > mem.len() { mem.resize(buf + bytes.len(), 0); }
+                                if mem.len() < buf + bytes.len() { mem.resize(buf + bytes.len(), 0); }
                                 mem[buf..buf+bytes.len()].copy_from_slice(&bytes);
                             }
-                            state.regs.insert(rax, bytes.len() as u64);
+                            // Return number of bytes read (excluding NUL terminator)
+                            let reported = if bytes.len() == 0 { 0 } else { bytes.len() - 1 };
+                            state.regs.insert(rax, reported as u64);
                         } else { state.regs.insert(rax, 0); }
                     }
                     _ => {
@@ -1072,4 +1111,170 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
         }
     }
     Ok(state)
+}
+
+// ---------------- Simple CLI Debugger ----------------
+
+fn opcode_name(op: u8) -> &'static str {
+    match op {
+        0x00 => "NOP",
+        0x01 => "MOV",
+        0x02 => "ADD",
+        0x03 => "SUB",
+        0x10 => "JMP",
+        0x11 => "CMP",
+        0x12 => "JE",
+        0x13 => "JNE",
+        0x14 => "JL",
+        0x15 => "JLE",
+        0x16 => "JG",
+        0x17 => "JGE",
+        0x20 => "CALL",
+        0x21 => "RET",
+        0x30 => "PUSH",
+        0x31 => "POP",
+        0x40 => "OUT",
+        0x41 => "COUT",
+        0x42 => "IN",
+        0x50 => "ENTER",
+        0x51 => "LEAVE",
+        0x60 => "MNI",
+        0x70 => "FMOV",
+        0x71 => "FADD",
+        0x72 => "FSUB",
+        0x73 => "FMUL",
+        0x74 => "FDIV",
+        0x75 => "FCMP",
+        0x76 => "FJE",
+        0x77 => "FJNE",
+        0x78 => "FJLT",
+        0x79 => "FJLE",
+        0x7A => "FJGT",
+        0x7B => "FJGE",
+        0x7C => "FJUO",
+        0xFF => "HLT",
+        _ => "?",
+    }
+}
+
+pub struct CliDebugger {
+    breakpoints: HashSet<usize>,
+    running: bool,
+}
+
+impl CliDebugger {
+    pub fn new() -> Self { Self { breakpoints: HashSet::new(), running: false } }
+
+    fn parse_addr(&self, masi: &MASIFile, tok: &str) -> Option<usize> {
+        if tok.starts_with("0x") { usize::from_str_radix(&tok[2..], 16).ok() }
+        else if tok.chars().all(|c| c.is_ascii_digit()) { tok.parse::<usize>().ok() }
+        else {
+            // try label name
+            for (off, name) in masi.label_map.iter() {
+                if name == tok { return Some(*off as usize); }
+            }
+            None
+        }
+    }
+
+    fn print_regs(&self, state: &State) {
+        let rev = RegisterMap::build_id_to_name();
+        let mut ids: Vec<_> = rev.keys().copied().collect();
+        ids.sort();
+        let mut line = String::new();
+        for id in ids {
+            let name = rev.get(&id).unwrap();
+            let val = state.regs.get(&id).copied().unwrap_or(0);
+            line.push_str(&format!("{}=0x{:016X} ", name, val));
+        }
+        println!("{}", line.trim());
+        let (zf, sf, cf, of) = state.flags; println!("FLAGS: ZF={} SF={} CF={} OF={}", zf, sf, cf, of);
+        println!("RIP=0x{:016X}", state.rip);
+    }
+
+    fn print_mem(&self, state: &State, addr: usize, len: usize) {
+        let mem = state.memory.lock().unwrap();
+        let end = addr.saturating_add(len).min(mem.len());
+        let mut i = addr;
+        while i < end {
+            print!("{:08X}: ", i);
+            for j in 0..16 {
+                if i + j < end { print!("{:02X} ", mem[i + j]); } else { print!("   "); }
+            }
+            print!(" | ");
+            for j in 0..16 { if i + j < end { let b=mem[i+j]; let c= if (32..=126).contains(&b) { b as char } else { '.' }; print!("{}", c); } }
+            println!();
+            i = i.saturating_add(16);
+        }
+    }
+
+    fn prompt(&self, masi: &MASIFile, _state: &State, pc: usize, opcode: u8) {
+        let where_s = if let Some(name) = masi.label_map.get(&(pc as u64)) { format!("{} (0x{:X})", name, pc) } else { format!("0x{:X}", pc) };
+        println!("stopped at {}: {} (0x{:02X})", where_s, opcode_name(opcode), opcode);
+    }
+}
+
+impl Debugger for CliDebugger {
+    fn before_execute(&mut self, masi: &MASIFile, state: &State, pc: usize, opcode: u8) -> DebuggerControl {
+        if self.running && !self.breakpoints.contains(&pc) { return DebuggerControl::Continue; }
+        self.prompt(masi, state, pc, opcode);
+        // simple REPL
+        let stdin = io::stdin();
+        loop {
+            print!("(masmdbg) ");
+            let _ = io::stdout().flush();
+            let mut line = String::new();
+            if stdin.read_line(&mut line).is_err() { return DebuggerControl::Exit; }
+            let line = line.trim();
+            if line.is_empty() { // default: step
+                self.running = false; return DebuggerControl::Continue;
+            }
+            let mut parts = line.split_whitespace();
+            let cmd = parts.next().unwrap_or("");
+            match cmd {
+                "c" | "cont" | "continue" => { self.running = true; return DebuggerControl::Continue; }
+                "s" | "si" | "step" => { self.running = false; return DebuggerControl::Continue; }
+                "q" | "quit" | "exit" => { return DebuggerControl::Exit; }
+                "b" | "break" => {
+                    if let Some(arg) = parts.next() {
+                        if let Some(addr) = self.parse_addr(masi, arg) { self.breakpoints.insert(addr); println!("Breakpoint set at 0x{:X}", addr); }
+                        else { println!("Unknown address/label: {}", arg); }
+                    } else { println!("usage: break <addr|label>"); }
+                }
+                "db" | "del" | "delete" => {
+                    if let Some(arg) = parts.next() {
+                        if let Some(addr) = self.parse_addr(masi, arg) { self.breakpoints.remove(&addr); println!("Deleted breakpoint at 0x{:X}", addr); }
+                        else { println!("Unknown address/label: {}", arg); }
+                    } else { println!("usage: delete <addr|label>"); }
+                }
+                "info" => {
+                    match parts.next().unwrap_or("") {
+                        "b" | "break" | "breakpoints" => {
+                            if self.breakpoints.is_empty() { println!("(no breakpoints)"); }
+                            else {
+                                let mut v: Vec<_> = self.breakpoints.iter().copied().collect();
+                                v.sort();
+                                for bp in v { if let Some(name) = masi.label_map.get(&(bp as u64)) { println!("- {} (0x{:X})", name, bp); } else { println!("- 0x{:X}", bp); } }
+                            }
+                        }
+                        _ => println!("usage: info breakpoints"),
+                    }
+                }
+                "regs" | "registers" => { self.print_regs(state); }
+                "x" => {
+                    // examine memory: x <addr> [len]
+                    if let Some(arg) = parts.next() {
+                        if let Some(addr) = self.parse_addr(masi, arg) {
+                            let len = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(64);
+                            self.print_mem(state, addr, len);
+                        } else { println!("Unknown address/label: {}", arg); }
+                    } else { println!("usage: x <addr|label> [len]"); }
+                }
+                "help" | "h" => {
+                    println!("Commands: step(s), continue(c), break(b) <addr|label>, delete(db) <addr|label>, info breakpoints, regs, x <addr> [len], quit(q)");
+                }
+                _ => { println!("unknown command: {} (type 'help')", cmd); }
+            }
+        }
+    }
 }

@@ -10,3 +10,7 @@ libloading = { version = "0.8", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+# Enables additional debug printing in the interpreter via the debug_println! macro.
+debug_print = []

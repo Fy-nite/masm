@@ -234,6 +234,12 @@ fn parse_data_line(line: &str, data: &mut DataSections) -> bool {
                         "QWORD" => {
                             if let Ok(v) = value_str.parse::<i128>() { data.directives.push(DataDirective::Dq(Some(name.to_string()), vec![v as u64])); return true; }
                         }
+                        "PTR" => {
+                            // PTR is an alias for an address-sized state variable; initialize to 0 unless a value is provided
+                            if value_str.is_empty() {
+                                data.directives.push(DataDirective::Dq(Some(name.to_string()), vec![0u64])); return true;
+                            } else if let Ok(v) = value_str.parse::<i128>() { data.directives.push(DataDirective::Dq(Some(name.to_string()), vec![v as u64])); return true; }
+                        }
                         "FLOAT" => {
                             if let Ok(v) = value_str.parse::<f32>() { data.directives.push(DataDirective::Df(Some(name.to_string()), vec![v])); return true; }
                         }

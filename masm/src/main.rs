@@ -7,6 +7,7 @@ mod linker;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use interpreter::{CliDebugger, set_thread_debugger};
 
 fn print_usage() {
     eprintln!(
@@ -22,6 +23,7 @@ fn main() {
     let mut dump: bool = false;
     let mut run_flag: bool = false;
     let mut link_mode: bool = false;
+    let mut debug_mode: bool = false;
     let mut link_inputs: Vec<String> = Vec::new();
 
     while let Some(a) = args.next() {
@@ -36,6 +38,7 @@ fn main() {
             "--disasm" | "-x" => { disasm = true; }
             "--dump" | "-t" => { dump = true; }
             "--run" | "-r" => { run_flag = true; }
+            "--debug" | "-g" => { debug_mode = true; run_flag = true; }
             _ => {
                 let lower = a.to_lowercase();
                 if lower == "link" { link_mode = true; }
@@ -66,6 +69,9 @@ fn main() {
         let path_str = input_path.to_string_lossy();
         let masi = match disassembler::load(&path_str) { Ok(m) => m, Err(e) => { eprintln!("Failed to load MASI: {}", e); return; } };
         if run_flag || (!disasm && !dump) {
+            if debug_mode {
+                set_thread_debugger(Some(Box::new(CliDebugger::new())));
+            }
             if let Err(e) = interpreter::run_masi(&masi) { eprintln!("Run failed: {}", e); }
             return;
         }
