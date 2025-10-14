@@ -110,11 +110,17 @@ struct Reloc {
 }
 
 #[derive(Debug, Clone)]
+enum DataValue {
+    Imm(u64),
+    Sym(String),
+}
+
+#[derive(Debug, Clone)]
 enum DataDirective {
     Db(Option<String>, Vec<u8>),
     Dw(Option<String>, Vec<u16>),
     Dd(Option<String>, Vec<u32>),
-    Dq(Option<String>, Vec<u64>),
+    Dq(Option<String>, Vec<DataValue>),
     Df(Option<String>, Vec<f32>),
     Ddbl(Option<String>, Vec<f64>),
     Res(Option<String>, usize),
@@ -232,13 +238,29 @@ fn parse_data_line(line: &str, data: &mut DataSections) -> bool {
                             if let Ok(v) = value_str.parse::<i64>() { data.directives.push(DataDirective::Dd(Some(name.to_string()), vec![v as u32])); return true; }
                         }
                         "QWORD" => {
-                            if let Ok(v) = value_str.parse::<i128>() { data.directives.push(DataDirective::Dq(Some(name.to_string()), vec![v as u64])); return true; }
+                            if let Ok(v) = value_str.parse::<i128>() { data.directives.push(DataDirective::Dq(Some(name.to_string()), vec![DataValue::Imm(v as u64)])); return true; }
+                        }
+                        "STRING" => {
+                            // value_str expected to be a string literal like "hello" or empty
+                            if let Some(bytes) = parse_string_literal(value_str) {
+                                // create a generated label for this string and store bytes as a Db entry
+                                let mut gen_label = String::from("__str_");
+                                gen_label.push_str(&uuid_like::short_hash(&bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>()));
+                                // ensure null-terminated
+                                let mut b2 = bytes.clone();
+                                b2.push(0);
+                                // push the bytes as a Db with the generated label
+                                data.directives.push(DataDirective::Db(Some(gen_label.clone()), b2));
+                                // now push a Dq with a symbolic reference to the generated label
+                                data.directives.push(DataDirective::Dq(Some(name.to_string()), vec![DataValue::Sym(gen_label)]));
+                                return true;
+                            }
                         }
                         "PTR" => {
                             // PTR is an alias for an address-sized state variable; initialize to 0 unless a value is provided
                             if value_str.is_empty() {
-                                data.directives.push(DataDirective::Dq(Some(name.to_string()), vec![0u64])); return true;
-                            } else if let Ok(v) = value_str.parse::<i128>() { data.directives.push(DataDirective::Dq(Some(name.to_string()), vec![v as u64])); return true; }
+                                data.directives.push(DataDirective::Dq(Some(name.to_string()), vec![DataValue::Imm(0u64)])); return true;
+                            } else if let Ok(v) = value_str.parse::<i128>() { data.directives.push(DataDirective::Dq(Some(name.to_string()), vec![DataValue::Imm(v as u64)])); return true; }
                         }
                         "FLOAT" => {
                             if let Ok(v) = value_str.parse::<f32>() { data.directives.push(DataDirective::Df(Some(name.to_string()), vec![v])); return true; }
@@ -295,11 +317,14 @@ fn parse_data_line(line: &str, data: &mut DataSections) -> bool {
         return true;
     } else if lower.starts_with("dq ") {
         let rhs = rest[3..].to_string();
-        let mut vals: Vec<u64> = Vec::new();
+        let mut vals: Vec<DataValue> = Vec::new();
         for tok in parse_values(&rhs) {
             if tok.starts_with('#') { /* not supported */ }
-            if tok.to_lowercase().starts_with("0x") { if let Ok(v) = u64::from_str_radix(&tok[2..], 16) { vals.push(v); } }
-            else if let Ok(v) = tok.parse::<u64>() { vals.push(v); }
+            else if tok.to_lowercase().starts_with("0x") { if let Ok(v) = u64::from_str_radix(&tok[2..], 16) { vals.push(DataValue::Imm(v)); } }
+            else if let Ok(v) = tok.parse::<u64>() { vals.push(DataValue::Imm(v)); }
+            else { // treat as symbolic reference
+                vals.push(DataValue::Sym(tok));
+            }
         }
         data.directives.push(DataDirective::Dq(label_name, vals));
         return true;
@@ -421,7 +446,7 @@ fn expand_includes(src: &str, base_dir: Option<&Path>) -> Result<String, String>
         path.to_path_buf()
     }
     fn expand_recursive(src: &str, base: Option<&Path>, depth: usize) -> Result<String, String> {
-        if depth > 32 { return Err("Include depth exceeds limit".to_string()); }
+        if depth > 32 { return Err(format!("error[EASM004]: include depth exceeds limit (depth={})", depth)); }
         let mut out: String = String::new();
         for raw in src.lines() {
             let mut line = raw.to_string();
@@ -476,13 +501,13 @@ fn parse_instructions(src: &str, base_dir: Option<&Path>) -> (Vec<Instruction>, 
                 Ok(bytes) => {
                     if is_dq {
                         // Emit as DQ words (pad to 8-bytes)
-                        let mut qws: Vec<u64> = Vec::new();
+                        let mut qws: Vec<DataValue> = Vec::new();
                         let mut buf = bytes.clone();
                         while buf.len() % 8 != 0 { buf.push(0); }
                         for chunk in buf.chunks(8) {
                             let mut arr = [0u8;8];
                             arr.copy_from_slice(chunk);
-                            qws.push(u64::from_le_bytes(arr));
+                            qws.push(DataValue::Imm(u64::from_le_bytes(arr)));
                         }
                         data.directives.push(DataDirective::Dq(Some(label.clone()), qws));
                     } else {
@@ -490,12 +515,12 @@ fn parse_instructions(src: &str, base_dir: Option<&Path>) -> (Vec<Instruction>, 
                         let byte_len = bytes_clone.len() as u64;
                         data.directives.push(DataDirective::Db(Some(label.clone()), bytes_clone));
                         // Always emit <label>_len as DQ of total byte length (from in-memory bytes)
-                        data.directives.push(DataDirective::Dq(Some(format!("{}_len", label)), vec![byte_len]));
+                        data.directives.push(DataDirective::Dq(Some(format!("{}_len", label)), vec![DataValue::Imm(byte_len)]));
                         continue;
                     }
                     // Always emit <label>_len as DQ of total byte length (from in-memory bytes)
                     let byte_len = bytes.len() as u64;
-                    data.directives.push(DataDirective::Dq(Some(format!("{}_len", label)), vec![byte_len]));
+                    data.directives.push(DataDirective::Dq(Some(format!("{}_len", label)), vec![DataValue::Imm(byte_len)]));
                 }
                 Err(e) => {
                     eprintln!("Failed to read include data '{}': {}", abs.display(), e);
@@ -595,7 +620,7 @@ fn parse_instructions(src: &str, base_dir: Option<&Path>) -> (Vec<Instruction>, 
                 }
             }
             ("syscall", 0) => insts.push(Instruction::Syscall),
-            _ => { eprintln!("Error: Unrecognized instruction or wrong number of operands: {}", trimmed); }
+            _ => { eprintln!("error[EASM001]: unrecognized instruction or operand count\n  --> <input>: ?\n   = help: got: '{}'", trimmed); }
         }
     }
     (insts, data)
@@ -682,6 +707,7 @@ pub fn assemble_to_masi(src: &str) -> Result<Vec<u8>, String> {
     // Expand includes first to error early on missing files
     let expanded = expand_includes(src, None)?;
     let (insts, mut data) = parse_instructions(&expanded, None);
+    let mut diag_errors: Vec<String> = Vec::new();
 
     // First pass: compute labels and code size to get entry offset
     let mut labels: HashMap<String, usize> = HashMap::new();
@@ -689,7 +715,12 @@ pub fn assemble_to_masi(src: &str) -> Result<Vec<u8>, String> {
     let mut entry: Option<usize> = None;
     for ins in &insts {
         match ins {
-            Instruction::Label(name) => { labels.insert(name.clone(), pc); },
+            Instruction::Label(name) => {
+                if labels.contains_key(name) {
+                    diag_errors.push(format!("error[EASM002]: duplicate code label '{}'", name));
+                }
+                labels.insert(name.clone(), pc);
+            },
             Instruction::Ret | Instruction::Hlt | Instruction::Nop | Instruction::Leave => { if entry.is_none() { entry = Some(pc); } pc += 1; },
             Instruction::Syscall => { if entry.is_none() { entry = Some(pc); } pc += 1; },
             Instruction::Enter(_) => { if entry.is_none() { entry = Some(pc); } pc += 1 + (1+8); },
@@ -708,31 +739,60 @@ pub fn assemble_to_masi(src: &str) -> Result<Vec<u8>, String> {
     for d in &data.directives {
         match d {
             DataDirective::Db(label, bytes) => {
-                if let Some(name) = label { data.data_label_offsets.insert(name.clone(), data_bytes.len()); }
+                if let Some(name) = label {
+                    if data.data_label_offsets.contains_key(name) { diag_errors.push(format!("error[EASM002]: duplicate data label '{}'", name)); }
+                    data.data_label_offsets.insert(name.clone(), data_bytes.len());
+                }
                 data_bytes.extend_from_slice(bytes);
             }
             DataDirective::Dw(label, words) => {
-                if let Some(name) = label { data.data_label_offsets.insert(name.clone(), data_bytes.len()); }
+                if let Some(name) = label {
+                    if data.data_label_offsets.contains_key(name) { diag_errors.push(format!("error[EASM002]: duplicate data label '{}'", name)); }
+                    data.data_label_offsets.insert(name.clone(), data_bytes.len());
+                }
                 for w in words { data_bytes.extend_from_slice(&w.to_le_bytes()); }
             }
             DataDirective::Dd(label, dws) => {
-                if let Some(name) = label { data.data_label_offsets.insert(name.clone(), data_bytes.len()); }
+                if let Some(name) = label {
+                    if data.data_label_offsets.contains_key(name) { diag_errors.push(format!("error[EASM002]: duplicate data label '{}'", name)); }
+                    data.data_label_offsets.insert(name.clone(), data_bytes.len());
+                }
                 for w in dws { data_bytes.extend_from_slice(&w.to_le_bytes()); }
             }
             DataDirective::Dq(label, qws) => {
-                if let Some(name) = label { data.data_label_offsets.insert(name.clone(), data_bytes.len()); }
-                for w in qws { data_bytes.extend_from_slice(&w.to_le_bytes()); }
+                if let Some(name) = label {
+                    if data.data_label_offsets.contains_key(name) { diag_errors.push(format!("error[EASM002]: duplicate data label '{}'", name)); }
+                    data.data_label_offsets.insert(name.clone(), data_bytes.len());
+                }
+                for dv in qws.iter() {
+                    match dv {
+                        &DataValue::Imm(v) => { data_bytes.extend_from_slice(&v.to_le_bytes()); }
+                        &DataValue::Sym(ref s) => {
+                            if let Some(off) = data.data_label_offsets.get(s) { data_bytes.extend_from_slice(&(*off as u64).to_le_bytes()); }
+                            else { data_bytes.extend_from_slice(&0u64.to_le_bytes()); }
+                        }
+                    }
+                }
             }
             DataDirective::Df(label, floats) => {
-                if let Some(name) = label { data.data_label_offsets.insert(name.clone(), data_bytes.len()); }
+                if let Some(name) = label {
+                    if data.data_label_offsets.contains_key(name) { diag_errors.push(format!("error[EASM002]: duplicate data label '{}'", name)); }
+                    data.data_label_offsets.insert(name.clone(), data_bytes.len());
+                }
                 for f in floats { data_bytes.extend_from_slice(&f.to_bits().to_le_bytes()); }
             }
             DataDirective::Ddbl(label, doubles) => {
-                if let Some(name) = label { data.data_label_offsets.insert(name.clone(), data_bytes.len()); }
+                if let Some(name) = label {
+                    if data.data_label_offsets.contains_key(name) { diag_errors.push(format!("error[EASM002]: duplicate data label '{}'", name)); }
+                    data.data_label_offsets.insert(name.clone(), data_bytes.len());
+                }
                 for f in doubles { data_bytes.extend_from_slice(&f.to_bits().to_le_bytes()); }
             }
             DataDirective::Res(label, bytes) => {
-                if let Some(name) = label { data.data_label_offsets.insert(name.clone(), data_bytes.len()); }
+                if let Some(name) = label {
+                    if data.data_label_offsets.contains_key(name) { diag_errors.push(format!("error[EASM002]: duplicate data label '{}'", name)); }
+                    data.data_label_offsets.insert(name.clone(), data_bytes.len());
+                }
                 data_bytes.resize(data_bytes.len() + *bytes, 0);
             }
             DataDirective::DirectDb{ address, bytes, null_terminated } => {
@@ -741,6 +801,22 @@ pub fn assemble_to_masi(src: &str) -> Result<Vec<u8>, String> {
                 for (i, b) in bytes.iter().enumerate() { data_bytes[*address + i] = *b; }
                 if *null_terminated { data_bytes[*address + bytes.len()] = 0; }
             }
+        }
+    }
+
+    if !diag_errors.is_empty() {
+        return Err(diag_errors.join("\n"));
+    }
+
+    // Validate exports reference known symbols (EASM003)
+    for raw in &data.export_symbols {
+        let (kind, name) = if let Some(n) = raw.strip_prefix('#') { (0u8, n.to_string()) }
+                           else if let Some(n) = raw.strip_prefix('$') { (1u8, n.to_string()) }
+                           else { (0u8, raw.clone()) };
+        match kind {
+            0 => { if !labels.contains_key(&name) { return Err(format!("error[EASM003]: export of unknown code symbol '{}'", name)); } }
+            1 => { if !data.data_label_offsets.contains_key(&name) { return Err(format!("error[EASM003]: export of unknown data symbol '{}'", name)); } }
+            _ => {}
         }
     }
 
@@ -940,6 +1016,7 @@ pub fn assemble_to_masi_with_base(src: &str, base_dir: &str) -> Result<Vec<u8>, 
     // Expand includes first to error early on missing files
     let expanded = expand_includes(src, Some(base))?;
     let (insts, mut data) = parse_instructions(&expanded, Some(base));
+    let mut diag_errors: Vec<String> = Vec::new();
 
     // First pass: compute labels and code size to get entry offset
     let mut labels: HashMap<String, usize> = HashMap::new();
@@ -947,7 +1024,10 @@ pub fn assemble_to_masi_with_base(src: &str, base_dir: &str) -> Result<Vec<u8>, 
     let mut entry: Option<usize> = None;
     for ins in &insts {
         match ins {
-            Instruction::Label(name) => { labels.insert(name.clone(), pc); },
+            Instruction::Label(name) => {
+                if labels.contains_key(name) { diag_errors.push(format!("error[EASM002]: duplicate code label '{}'", name)); }
+                labels.insert(name.clone(), pc);
+            },
             Instruction::Ret | Instruction::Hlt | Instruction::Nop | Instruction::Leave => { if entry.is_none() { entry = Some(pc); } pc += 1; },
             Instruction::Syscall => { if entry.is_none() { entry = Some(pc); } pc += 1; },
             Instruction::Enter(_) => { if entry.is_none() { entry = Some(pc); } pc += 1 + (1+8); },
@@ -966,31 +1046,57 @@ pub fn assemble_to_masi_with_base(src: &str, base_dir: &str) -> Result<Vec<u8>, 
     for d in &data.directives {
         match d {
             DataDirective::Db(label, bytes) => {
-                if let Some(name) = label { data.data_label_offsets.insert(name.clone(), data_bytes.len()); }
+                if let Some(name) = label {
+                    if data.data_label_offsets.contains_key(name) { diag_errors.push(format!("error[EASM002]: duplicate data label '{}'", name)); }
+                    data.data_label_offsets.insert(name.clone(), data_bytes.len());
+                }
                 data_bytes.extend_from_slice(bytes);
             }
             DataDirective::Dw(label, words) => {
-                if let Some(name) = label { data.data_label_offsets.insert(name.clone(), data_bytes.len()); }
+                if let Some(name) = label {
+                    if data.data_label_offsets.contains_key(name) { diag_errors.push(format!("error[EASM002]: duplicate data label '{}'", name)); }
+                    data.data_label_offsets.insert(name.clone(), data_bytes.len());
+                }
                 for w in words { data_bytes.extend_from_slice(&w.to_le_bytes()); }
             }
             DataDirective::Dd(label, dws) => {
-                if let Some(name) = label { data.data_label_offsets.insert(name.clone(), data_bytes.len()); }
+                if let Some(name) = label {
+                    if data.data_label_offsets.contains_key(name) { diag_errors.push(format!("error[EASM002]: duplicate data label '{}'", name)); }
+                    data.data_label_offsets.insert(name.clone(), data_bytes.len());
+                }
                 for w in dws { data_bytes.extend_from_slice(&w.to_le_bytes()); }
             }
             DataDirective::Dq(label, qws) => {
-                if let Some(name) = label { data.data_label_offsets.insert(name.clone(), data_bytes.len()); }
-                for w in qws { data_bytes.extend_from_slice(&w.to_le_bytes()); }
+                if let Some(name) = label {
+                    if data.data_label_offsets.contains_key(name) { diag_errors.push(format!("error[EASM002]: duplicate data label '{}'", name)); }
+                    data.data_label_offsets.insert(name.clone(), data_bytes.len());
+                }
+                for dv in qws.iter() {
+                    match dv {
+                        &DataValue::Imm(v) => { data_bytes.extend_from_slice(&v.to_le_bytes()); }
+                        &DataValue::Sym(ref s) => { if let Some(off) = data.data_label_offsets.get(s) { data_bytes.extend_from_slice(&(*off as u64).to_le_bytes()); } else { data_bytes.extend_from_slice(&0u64.to_le_bytes()); } }
+                    }
+                }
             }
             DataDirective::Df(label, floats) => {
-                if let Some(name) = label { data.data_label_offsets.insert(name.clone(), data_bytes.len()); }
+                if let Some(name) = label {
+                    if data.data_label_offsets.contains_key(name) { diag_errors.push(format!("error[EASM002]: duplicate data label '{}'", name)); }
+                    data.data_label_offsets.insert(name.clone(), data_bytes.len());
+                }
                 for f in floats { data_bytes.extend_from_slice(&f.to_bits().to_le_bytes()); }
             }
             DataDirective::Ddbl(label, doubles) => {
-                if let Some(name) = label { data.data_label_offsets.insert(name.clone(), data_bytes.len()); }
+                if let Some(name) = label {
+                    if data.data_label_offsets.contains_key(name) { diag_errors.push(format!("error[EASM002]: duplicate data label '{}'", name)); }
+                    data.data_label_offsets.insert(name.clone(), data_bytes.len());
+                }
                 for f in doubles { data_bytes.extend_from_slice(&f.to_bits().to_le_bytes()); }
             }
             DataDirective::Res(label, bytes) => {
-                if let Some(name) = label { data.data_label_offsets.insert(name.clone(), data_bytes.len()); }
+                if let Some(name) = label {
+                    if data.data_label_offsets.contains_key(name) { diag_errors.push(format!("error[EASM002]: duplicate data label '{}'", name)); }
+                    data.data_label_offsets.insert(name.clone(), data_bytes.len());
+                }
                 data_bytes.resize(data_bytes.len() + *bytes, 0);
             }
             DataDirective::DirectDb{ address, bytes, null_terminated } => {
@@ -999,6 +1105,22 @@ pub fn assemble_to_masi_with_base(src: &str, base_dir: &str) -> Result<Vec<u8>, 
                 for (i, b) in bytes.iter().enumerate() { data_bytes[*address + i] = *b; }
                 if *null_terminated { data_bytes[*address + bytes.len()] = 0; }
             }
+        }
+    }
+
+    if !diag_errors.is_empty() {
+        return Err(diag_errors.join("\n"));
+    }
+
+    // Validate exports reference known symbols (EASM003)
+    for raw in &data.export_symbols {
+        let (kind, name) = if let Some(n) = raw.strip_prefix('#') { (0u8, n.to_string()) }
+                           else if let Some(n) = raw.strip_prefix('$') { (1u8, n.to_string()) }
+                           else { (0u8, raw.clone()) };
+        match kind {
+            0 => { if !labels.contains_key(&name) { return Err(format!("error[EASM003]: export of unknown code symbol '{}'", name)); } }
+            1 => { if !data.data_label_offsets.contains_key(&name) { return Err(format!("error[EASM003]: export of unknown data symbol '{}'", name)); } }
+            _ => {}
         }
     }
 

@@ -15,7 +15,17 @@ pub fn link_files(paths: &[String]) -> Result<LinkedOutput, String> {
     use std::collections::HashMap;
     let mut export_map: HashMap<(u8,String), (usize,u64)> = HashMap::new();
     for (i,f) in files.iter().enumerate() {
-        for ex in &f.exports { export_map.insert((ex.kind, ex.name.clone()), (i, ex.offset)); }
+        for ex in &f.exports {
+            let key = (ex.kind, ex.name.clone());
+            if export_map.contains_key(&key) {
+                let kind_s = if ex.kind==0 { "code" } else { "data" };
+                return Err(format!(
+                    "error[ELD001]: duplicate export symbol '{} {}'\n   = note: symbol exported from at least two inputs",
+                    kind_s, ex.name
+                ));
+            }
+            export_map.insert(key, (i, ex.offset));
+        }
     }
 
     // Concatenate code; track start offsets per file
@@ -42,7 +52,11 @@ pub fn link_files(paths: &[String]) -> Result<LinkedOutput, String> {
                     }
                 }
             } else {
-                return Err(format!("unresolved import: {} {}", if im.kind==0 {"code"} else {"data"}, im.name));
+                let kind_s = if im.kind==0 { "code" } else { "data" };
+                return Err(format!(
+                    "error[ELD002]: unresolved import: {} {}\n   = help: ensure the providing object exports this symbol or link it before users",
+                    kind_s, im.name
+                ));
             }
         }
     }

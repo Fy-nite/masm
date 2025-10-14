@@ -249,7 +249,15 @@ fn read_u64_from_memory(addr: u64, state: &State) -> u64 {
 fn write_u64_to_memory(addr: u64, value: u64, state: &mut State) {
     let a = addr as usize; if a > usize::MAX - 8 { return; }
     let mut mem = state.memory.lock().unwrap();
-    if mem.len() < a + 8 { mem.resize(a + 8, 0); }
+    if mem.len() < a + 8 {
+        let old = mem.len();
+        mem.resize(a + 8, 0);
+        // Warn when writes extend memory (helps catch likely bugs)
+        state.warnings.push(format!(
+            "warning: write extended memory from {} to {}\n  --> pc: 0x{:X}\n   = note: store at 0x{:X} (size 8)",
+            old, mem.len(), state.rip, a
+        ));
+    }
     let mut v = value; for i in 0..8 { mem[a+i] = (v & 0xFF) as u8; v >>= 8; }
 }
 
@@ -332,7 +340,10 @@ fn get_operand(code: &[u8], pc: &mut usize, state: &mut State) -> u64 {
             {
                 let mem = state.memory.lock().unwrap();
                 if a >= mem.len() || a.saturating_add(8) > mem.len() {
-                    state.warnings.push(format!("read_u64 OOB at 0x{:X} (mem size {})", a, mem.len()));
+                    state.warnings.push(format!(
+                        "warning: read_u64 OOB at 0x{:X} (mem size {})\n  --> pc: 0x{:X}",
+                        a, mem.len(), state.rip
+                    ));
                 }
             }
             read_u64_from_memory(val, state)
@@ -342,7 +353,10 @@ fn get_operand(code: &[u8], pc: &mut usize, state: &mut State) -> u64 {
             {
                 let mem = state.memory.lock().unwrap();
                 if a >= mem.len() || a.saturating_add(8) > mem.len() {
-                    state.warnings.push(format!("read_u64 OOB at 0x{:X} (mem size {})", a, mem.len()));
+                    state.warnings.push(format!(
+                        "warning: read_u64 OOB at 0x{:X} (mem size {})\n  --> pc: 0x{:X}",
+                        a, mem.len(), state.rip
+                    ));
                 }
             }
             read_u64_from_memory(addr, state)
@@ -491,7 +505,7 @@ pub fn run_masi_from_bytes(buf: &[u8]) -> Result<State, String> {
     let mut out = io::stdout();
     let mut err = io::stderr();
     let mut stdin_lock = io::stdin().lock();
-    run_masi_with_io(&masi, &mut out, &mut err, Some(&mut stdin_lock))
+    run_masi_with_io(&masi, &mut out as &mut dyn Write, &mut err as &mut dyn Write, Some(&mut stdin_lock as &mut dyn BufRead))
 }
 
 /// Compile a MASM source string into MASI bytes. This is a stub; the assembler is not implemented here.
@@ -506,7 +520,7 @@ pub fn run_masi(masi: &MASIFile) -> Result<(), String> {
     let mut out = io::stdout();
     let mut err = io::stderr();
     let mut stdin_lock = io::stdin().lock();
-    let _state = run_masi_with_io(masi, &mut out, &mut err, Some(&mut stdin_lock))?;
+    let _state = run_masi_with_io(masi, &mut out as &mut dyn Write, &mut err as &mut dyn Write, Some(&mut stdin_lock as &mut dyn BufRead))?;
     Ok(())
 }
 
@@ -515,11 +529,11 @@ pub fn run_masi(masi: &MASIFile) -> Result<(), String> {
 /// - out: where OUT/COUT to port 1 prints go (newline semantics preserved)
 /// - err: where OUT/COUT to port 2 prints go
 /// - input: optional buffered reader used by IN; if None, reads from stdin
-pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
+pub fn run_masi_with_io(
     masi: &MASIFile,
-    out: &mut WO,
-    err: &mut WE,
-    mut input: Option<&mut R>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    mut input: Option<&mut dyn BufRead>,
 ) -> Result<State, String> {
     let mut state = State::default();
     // initialize shared memory from MASI data
@@ -779,6 +793,9 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
                     let a = f64::from_bits(a_bits);
                     let b = f64::from_bits(src_bits);
                     let r = a + b;
+                    if r.is_nan() || r.is_infinite() {
+                        state.warnings.push(format!("warning: FP result is {}\n  --> pc: 0x{:X}", if r.is_nan() { "NaN" } else { "infinite" }, state.rip));
+                    }
                     state.regs.insert(id, r.to_bits());
                 }
             }
@@ -796,6 +813,9 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
                     let a = f64::from_bits(a_bits);
                     let b = f64::from_bits(src_bits);
                     let r = a - b;
+                    if r.is_nan() || r.is_infinite() {
+                        state.warnings.push(format!("warning: FP result is {}\n  --> pc: 0x{:X}", if r.is_nan() { "NaN" } else { "infinite" }, state.rip));
+                    }
                     state.regs.insert(id, r.to_bits());
                 }
             }
@@ -808,6 +828,9 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
                     let a = f64::from_bits(a_bits);
                     let b = f64::from_bits(src_bits);
                     let r = a * b;
+                    if r.is_nan() || r.is_infinite() {
+                        state.warnings.push(format!("warning: FP result is {}\n  --> pc: 0x{:X}", if r.is_nan() { "NaN" } else { "infinite" }, state.rip));
+                    }
                     state.regs.insert(id, r.to_bits());
                 }
             }
@@ -820,6 +843,9 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
                     let a = f64::from_bits(a_bits);
                     let b = f64::from_bits(src_bits);
                     let r = a / b; // IEEE-754: handles div by zero -> inf or NaN
+                    if r.is_nan() || r.is_infinite() {
+                        state.warnings.push(format!("warning: FP result is {}\n  --> pc: 0x{:X}", if r.is_nan() { "NaN" } else { "infinite" }, state.rip));
+                    }
                     state.regs.insert(id, r.to_bits());
                 }
             }
@@ -844,24 +870,254 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
                     state.flags = (false, false, true, false); // greater-than
                 }
             }
-            x if x == Op::Jmp as u8 => { let t = get_operand(code, &mut pc, &mut state); pc = t as usize; }
-            x if x == Op::Je  as u8 => { let t = get_operand(code, &mut pc, &mut state); if state.flags.0 { pc = t as usize; } }
-            x if x == Op::Jne as u8 => { let t = get_operand(code, &mut pc, &mut state); if !state.flags.0 { pc = t as usize; } }
-            x if x == Op::Jl  as u8 => { let t = get_operand(code, &mut pc, &mut state); let (zf, sf, _cf, of) = state.flags; if (sf ^ of) && !zf { pc = t as usize; } }
-            x if x == Op::Jle as u8 => { let t = get_operand(code, &mut pc, &mut state); let (zf, sf, _cf, of) = state.flags; if zf || (sf ^ of) { pc = t as usize; } }
-            x if x == Op::Jg  as u8 => { let t = get_operand(code, &mut pc, &mut state); let (zf, sf, _cf, of) = state.flags; if !zf && !(sf ^ of) { pc = t as usize; } }
-            x if x == Op::Jge as u8 => { let t = get_operand(code, &mut pc, &mut state); let (_zf, sf, _cf, of) = state.flags; if !(sf ^ of) { pc = t as usize; } }
-            x if x == Op::FJe  as u8 => { let t = get_operand(code, &mut pc, &mut state); if state.flags.0 { pc = t as usize; } }
-            x if x == Op::FJne as u8 => { let t = get_operand(code, &mut pc, &mut state); if !state.flags.0 { pc = t as usize; } }
-            x if x == Op::FJlt as u8 => { let t = get_operand(code, &mut pc, &mut state); if state.flags.1 { pc = t as usize; } }
-            x if x == Op::FJle as u8 => { let t = get_operand(code, &mut pc, &mut state); if state.flags.0 || state.flags.1 { pc = t as usize; } }
-            x if x == Op::FJgt as u8 => { let t = get_operand(code, &mut pc, &mut state); if state.flags.2 { pc = t as usize; } }
-            x if x == Op::FJge as u8 => { let t = get_operand(code, &mut pc, &mut state); if state.flags.0 || state.flags.2 { pc = t as usize; } }
-            x if x == Op::FJuo as u8 => { let t = get_operand(code, &mut pc, &mut state); if state.flags.3 { pc = t as usize; } }
-            x if x == Op::Call as u8 => { let t = get_operand(code, &mut pc, &mut state); state.stack.push(pc as u64); pc = t as usize; }
-            x if x == Op::Ret as u8 => { if let Some(ret) = state.stack.pop() { pc = ret as usize; } }
+            x if x == Op::Jmp as u8 => {
+                let t = get_operand(code, &mut pc, &mut state);
+                let target = t as usize;
+                if target >= code.len() {
+                    let msg = format!(
+                        "error[EVM004]: invalid jump target\n  --> pc: 0x{:X}\n   = note: jump target 0x{:X}, code size {}",
+                        state.rip, target, code.len()
+                    );
+                    state.errors.push(msg.clone());
+                    return Err(msg);
+                }
+                pc = target;
+            }
+            x if x == Op::Je  as u8 => {
+                let t = get_operand(code, &mut pc, &mut state);
+                if state.flags.0 {
+                    let target = t as usize;
+                    if target >= code.len() {
+                        let msg = format!(
+                            "error[EVM004]: invalid jump target\n  --> pc: 0x{:X}\n   = note: jump target 0x{:X}, code size {}",
+                            state.rip, target, code.len()
+                        );
+                        state.errors.push(msg.clone());
+                        return Err(msg);
+                    }
+                    pc = target;
+                }
+            }
+            x if x == Op::Jne as u8 => {
+                let t = get_operand(code, &mut pc, &mut state);
+                if !state.flags.0 {
+                    let target = t as usize;
+                    if target >= code.len() {
+                        let msg = format!(
+                            "error[EVM004]: invalid jump target\n  --> pc: 0x{:X}\n   = note: jump target 0x{:X}, code size {}",
+                            state.rip, target, code.len()
+                        );
+                        state.errors.push(msg.clone());
+                        return Err(msg);
+                    }
+                    pc = target;
+                }
+            }
+            x if x == Op::Jl  as u8 => {
+                let t = get_operand(code, &mut pc, &mut state);
+                let (zf, sf, _cf, of) = state.flags;
+                if (sf ^ of) && !zf {
+                    let target = t as usize;
+                    if target >= code.len() {
+                        let msg = format!(
+                            "error[EVM004]: invalid jump target\n  --> pc: 0x{:X}\n   = note: jump target 0x{:X}, code size {}",
+                            state.rip, target, code.len()
+                        );
+                        state.errors.push(msg.clone());
+                        return Err(msg);
+                    }
+                    pc = target;
+                }
+            }
+            x if x == Op::Jle as u8 => {
+                let t = get_operand(code, &mut pc, &mut state);
+                let (zf, sf, _cf, of) = state.flags;
+                if zf || (sf ^ of) {
+                    let target = t as usize;
+                    if target >= code.len() {
+                        let msg = format!(
+                            "error[EVM004]: invalid jump target\n  --> pc: 0x{:X}\n   = note: jump target 0x{:X}, code size {}",
+                            state.rip, target, code.len()
+                        );
+                        state.errors.push(msg.clone());
+                        return Err(msg);
+                    }
+                    pc = target;
+                }
+            }
+            x if x == Op::Jg  as u8 => {
+                let t = get_operand(code, &mut pc, &mut state);
+                let (zf, sf, _cf, of) = state.flags;
+                if !zf && !(sf ^ of) {
+                    let target = t as usize;
+                    if target >= code.len() {
+                        let msg = format!(
+                            "error[EVM004]: invalid jump target\n  --> pc: 0x{:X}\n   = note: jump target 0x{:X}, code size {}",
+                            state.rip, target, code.len()
+                        );
+                        state.errors.push(msg.clone());
+                        return Err(msg);
+                    }
+                    pc = target;
+                }
+            }
+            x if x == Op::Jge as u8 => {
+                let t = get_operand(code, &mut pc, &mut state);
+                let (_zf, sf, _cf, of) = state.flags;
+                if !(sf ^ of) {
+                    let target = t as usize;
+                    if target >= code.len() {
+                        let msg = format!(
+                            "error[EVM004]: invalid jump target\n  --> pc: 0x{:X}\n   = note: jump target 0x{:X}, code size {}",
+                            state.rip, target, code.len()
+                        );
+                        state.errors.push(msg.clone());
+                        return Err(msg);
+                    }
+                    pc = target;
+                }
+            }
+            x if x == Op::FJe  as u8 => {
+                let t = get_operand(code, &mut pc, &mut state);
+                if state.flags.0 {
+                    let target = t as usize;
+                    if target >= code.len() {
+                        let msg = format!(
+                            "error[EVM004]: invalid jump target\n  --> pc: 0x{:X}\n   = note: jump target 0x{:X}, code size {}",
+                            state.rip, target, code.len()
+                        );
+                        state.errors.push(msg.clone());
+                        return Err(msg);
+                    }
+                    pc = target;
+                }
+            }
+            x if x == Op::FJne as u8 => {
+                let t = get_operand(code, &mut pc, &mut state);
+                if !state.flags.0 {
+                    let target = t as usize;
+                    if target >= code.len() {
+                        let msg = format!(
+                            "error[EVM004]: invalid jump target\n  --> pc: 0x{:X}\n   = note: jump target 0x{:X}, code size {}",
+                            state.rip, target, code.len()
+                        );
+                        state.errors.push(msg.clone());
+                        return Err(msg);
+                    }
+                    pc = target;
+                }
+            }
+            x if x == Op::FJlt as u8 => {
+                let t = get_operand(code, &mut pc, &mut state);
+                if state.flags.1 {
+                    let target = t as usize;
+                    if target >= code.len() {
+                        let msg = format!(
+                            "error[EVM004]: invalid jump target\n  --> pc: 0x{:X}\n   = note: jump target 0x{:X}, code size {}",
+                            state.rip, target, code.len()
+                        );
+                        state.errors.push(msg.clone());
+                        return Err(msg);
+                    }
+                    pc = target;
+                }
+            }
+            x if x == Op::FJle as u8 => {
+                let t = get_operand(code, &mut pc, &mut state);
+                if state.flags.0 || state.flags.1 {
+                    let target = t as usize;
+                    if target >= code.len() {
+                        let msg = format!(
+                            "error[EVM004]: invalid jump target\n  --> pc: 0x{:X}\n   = note: jump target 0x{:X}, code size {}",
+                            state.rip, target, code.len()
+                        );
+                        state.errors.push(msg.clone());
+                        return Err(msg);
+                    }
+                    pc = target;
+                }
+            }
+            x if x == Op::FJgt as u8 => {
+                let t = get_operand(code, &mut pc, &mut state);
+                if state.flags.2 {
+                    let target = t as usize;
+                    if target >= code.len() {
+                        let msg = format!(
+                            "error[EVM004]: invalid jump target\n  --> pc: 0x{:X}\n   = note: jump target 0x{:X}, code size {}",
+                            state.rip, target, code.len()
+                        );
+                        state.errors.push(msg.clone());
+                        return Err(msg);
+                    }
+                    pc = target;
+                }
+            }
+            x if x == Op::FJge as u8 => {
+                let t = get_operand(code, &mut pc, &mut state);
+                if state.flags.0 || state.flags.2 {
+                    let target = t as usize;
+                    if target >= code.len() {
+                        let msg = format!(
+                            "error[EVM004]: invalid jump target\n  --> pc: 0x{:X}\n   = note: jump target 0x{:X}, code size {}",
+                            state.rip, target, code.len()
+                        );
+                        state.errors.push(msg.clone());
+                        return Err(msg);
+                    }
+                    pc = target;
+                }
+            }
+            x if x == Op::FJuo as u8 => {
+                let t = get_operand(code, &mut pc, &mut state);
+                if state.flags.3 {
+                    let target = t as usize;
+                    if target >= code.len() {
+                        let msg = format!(
+                            "error[EVM004]: invalid jump target\n  --> pc: 0x{:X}\n   = note: jump target 0x{:X}, code size {}",
+                            state.rip, target, code.len()
+                        );
+                        state.errors.push(msg.clone());
+                        return Err(msg);
+                    }
+                    pc = target;
+                }
+            }
+            x if x == Op::Call as u8 => {
+                let t = get_operand(code, &mut pc, &mut state);
+                let target = t as usize;
+                if target >= code.len() {
+                    let msg = format!(
+                        "error[EVM003]: invalid call target\n  --> pc: 0x{:X}\n   = note: call target 0x{:X}, code size {}",
+                        state.rip, target, code.len()
+                    );
+                    state.errors.push(msg.clone());
+                    return Err(msg);
+                }
+                state.stack.push(pc as u64);
+                pc = target;
+            }
+            x if x == Op::Ret as u8 => {
+                if let Some(ret) = state.stack.pop() {
+                    let target = ret as usize;
+                    if target >= code.len() {
+                        let msg = format!(
+                            "error[EVM002]: return address outside code section\n  --> pc: 0x{:X}\n   = note: return target 0x{:X}, code size {}\n   = help: did you POP the return address by accident? (stack imbalance)",
+                            state.rip, target, code.len()
+                        );
+                        state.errors.push(msg.clone());
+                        return Err(msg);
+                    }
+                    pc = target;
+                }
+            }
             x if x == Op::Push as u8 => { let v = get_operand(code, &mut pc, &mut state); state.stack.push(v); }
-            x if x == Op::Pop  as u8 => { let dest_mode = code[pc]; pc += 1; let dest_id64 = read_u64_le(code, &mut pc); if dest_mode == 1 { if let Some(v) = state.stack.pop() { state.regs.insert(dest_id64 as u16, v); } } }
+            x if x == Op::Pop  as u8 => {
+                let dest_mode = code[pc]; pc += 1; let dest_id64 = read_u64_le(code, &mut pc);
+                if dest_mode == 1 {
+                    if let Some(v) = state.stack.pop() { state.regs.insert(dest_id64 as u16, v); }
+                    else { state.warnings.push(format!("warning: POP on empty stack\n  --> pc: 0x{:X}", state.rip)); }
+                }
+            }
             x if x == Op::Enter as u8 => {
                 let size = get_operand(code, &mut pc, &mut state);
                 let name_to_id = RegisterMap::build_name_to_id();
@@ -1057,16 +1313,37 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
                 }
             }
             x if x == Op::Out as u8 => {
-                // OUT port value: print string only if value is a memory address (mode 3 or 4), else print numeric value
+                // OUT port value: if value is a memory address (mode 3 or 4), print string; otherwise print numeric.
+                // Resolve port to a numeric value (supports immediate, register, code-addr, and mem-indirect forms).
                 let port_mode = code[pc]; pc += 1; let port_val = read_u64_le(code, &mut pc);
                 let val_mode = code[pc]; pc += 1; let val_val = read_u64_le(code, &mut pc);
-                let to_err = port_mode == 2 || port_val == 2;
+                let resolve_port = |mode: u8, val: u64, st: &State| -> u64 {
+                    match mode {
+                        0 | 2 => val,
+                        1 => { let id = val as u16; *st.regs.get(&id).unwrap_or(&0) }
+                        3 => read_u64_from_memory(val, st),
+                        4 => { let id = val as u16; let addr = *st.regs.get(&id).unwrap_or(&0); read_u64_from_memory(addr, st) }
+                        _ => val,
+                    }
+                };
+                let port_num = resolve_port(port_mode, port_val, &state);
+                let to_err = port_num == 2;
+                if port_num != 1 && port_num != 2 {
+                    state.warnings.push(format!(
+                        "warning: unknown OUT port {} (defaulting to stdout)\n  --> pc: 0x{:X}",
+                        port_num, state.rip
+                    ));
+                }
                 let w: &mut dyn Write = if to_err { err as &mut dyn Write } else { out as &mut dyn Write };
                 match val_mode {
                     3 | 4 => {
                         if let Some(s) = read_c_string(val_val, &state) {
                             let _ = writeln!(w, "{}", s);
                         } else {
+                            state.warnings.push(format!(
+                                "warning: OUT read invalid string address $0x{:X}\n  --> pc: 0x{:X}",
+                                val_val, state.rip
+                            ));
                             let _ = writeln!(w, "{}", val_val);
                         }
                     }
@@ -1080,14 +1357,38 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
                 }
             }
             x if x == Op::COut as u8 => {
+                // Print a single character or a C-string (no trailing newline).
+                // Resolve port and value using get_operand (supports immediates/regs/mem-addressing via modes inside get_operand paths).
                 let p = get_operand(code, &mut pc, &mut state);
                 let v = get_operand(code, &mut pc, &mut state);
                 let to_err = p == 2;
-                let ch: u8 = {
-                    let mem = state.memory.lock().unwrap();
-                    if (v as usize) < mem.len() { mem[v as usize] } else { v as u8 }
-                };
-                if to_err { let _ = err.write_all(&[ch]); let _ = err.flush(); } else { let _ = out.write_all(&[ch]); let _ = out.flush(); }
+                if p != 1 && p != 2 {
+                    state.warnings.push(format!(
+                        "warning: unknown COUT port {} (defaulting to stdout)\n  --> pc: 0x{:X}",
+                        p, state.rip
+                    ));
+                }
+                let w: &mut dyn Write = if to_err { err as &mut dyn Write } else { out as &mut dyn Write };
+                // Try to read a C-string at address v. If present, print it; else print a single byte.
+                if let Some(s) = read_c_string(v, &state) {
+                    let _ = write!(w, "{}", s);
+                    let _ = w.flush();
+                } else {
+                    let ch: u8 = {
+                        let mem = state.memory.lock().unwrap();
+                        if (v as usize) < mem.len() { mem[v as usize] } else { v as u8 }
+                    };
+                    {
+                        let mem_len = state.memory.lock().unwrap().len();
+                        if (v as usize) >= mem_len {
+                            state.warnings.push(format!(
+                                "warning: COUT read out-of-bounds at 0x{:X}\n  --> pc: 0x{:X}",
+                                v, state.rip
+                            ));
+                        }
+                    }
+                    if to_err { let _ = err.write_all(&[ch]); let _ = err.flush(); } else { let _ = out.write_all(&[ch]); let _ = out.flush(); }
+                }
             }
             x if x == Op::In as u8 => {
                 let dest_addr = get_operand(code, &mut pc, &mut state) as usize;
@@ -1103,11 +1404,27 @@ pub fn run_masi_with_io<R: BufRead, WO: Write, WE: Write>(
                 let mut bytes = line.into_bytes(); bytes.push(0);
                 {
                     let mut mem = state.memory.lock().unwrap();
-                    if dest_addr + bytes.len() > mem.len() { mem.resize(dest_addr + bytes.len(), 0); }
+                    if dest_addr + bytes.len() > mem.len() {
+                        let old = mem.len();
+                        mem.resize(dest_addr + bytes.len(), 0);
+                        state.warnings.push(format!(
+                            "warning: IN extended memory from {} to {}\n  --> pc: 0x{:X}",
+                            old, mem.len(), state.rip
+                        ));
+                    }
                     mem[dest_addr..dest_addr+bytes.len()].copy_from_slice(&bytes);
                 }
             }
             _ => {}
+        }
+        // Safety check: if PC moves past end of code unexpectedly, surface an error
+        if pc > code.len() {
+            let msg = format!(
+                "error[EVM001]: program counter moved past end of code\n  --> pc: 0x{:X}\n   = note: attempted to execute at 0x{:X}, code size {}",
+                state.rip, pc, code.len()
+            );
+            state.errors.push(msg.clone());
+            return Err(msg);
         }
     }
     Ok(state)
@@ -1212,6 +1529,104 @@ impl CliDebugger {
         let where_s = if let Some(name) = masi.label_map.get(&(pc as u64)) { format!("{} (0x{:X})", name, pc) } else { format!("0x{:X}", pc) };
         println!("stopped at {}: {} (0x{:02X})", where_s, opcode_name(opcode), opcode);
     }
+
+    fn fmt_op(&self, masi: &MASIFile, mode: u8, value: u64) -> String {
+        let reg_rev = RegisterMap::build_id_to_name();
+        match mode {
+            0 => {
+                if let Some(name) = masi.data_label_map.get(&value) { return format!("${}", name); }
+                format!("{}", value)
+            }
+            1 => {
+                let id = value as u16;
+                if let Some(n) = reg_rev.get(&id) { n.clone() } else { format!("REG{}", id) }
+            }
+            2 => {
+                if let Some(name) = masi.label_map.get(&value) { format!("#{}", name) } else { format!("#0x{:X}", value) }
+            }
+            3 => {
+                if let Some(name) = masi.data_label_map.get(&value) { format!("${}", name) } else { format!("$0x{:X}", value) }
+            }
+            4 => {
+                let id = value as u16;
+                if let Some(n) = reg_rev.get(&id) { format!("${}", n) } else { format!("$REG{}", id) }
+            }
+            _ => format!("{}", value),
+        }
+    }
+
+    fn read_op_pair<'a>(&self, code: &'a [u8], pc: &mut usize) -> Option<(u8, u64)> {
+        if *pc >= code.len() { return None; }
+        let mode = code[*pc]; *pc += 1;
+        if *pc + 8 > code.len() { return None; }
+        let val = read_u64_le(code, pc);
+        Some((mode, val))
+    }
+
+    fn disassemble_from(&self, masi: &MASIFile, start_pc: usize, count: usize) -> Vec<(usize, String)> {
+        let mut lines = Vec::new();
+        let mut pc = start_pc;
+        let code = &masi.code;
+        let mut n = 0;
+        while pc < code.len() && n < count {
+            let this_pc = pc;
+            let opcode = code[pc]; pc += 1;
+            let mut text = String::new();
+            match opcode {
+                0x01 => { let d=self.read_op_pair(code,&mut pc); let s=self.read_op_pair(code,&mut pc); if let (Some(d),Some(s))=(d,s){ text=format!("MOV {} {}", self.fmt_op(masi,d.0,d.1), self.fmt_op(masi,s.0,s.1)); } }
+                0x02 => { let d=self.read_op_pair(code,&mut pc); let s=self.read_op_pair(code,&mut pc); if let (Some(d),Some(s))=(d,s){ text=format!("ADD {} {}", self.fmt_op(masi,d.0,d.1), self.fmt_op(masi,s.0,s.1)); } }
+                0x03 => { let d=self.read_op_pair(code,&mut pc); let s=self.read_op_pair(code,&mut pc); if let (Some(d),Some(s))=(d,s){ text=format!("SUB {} {}", self.fmt_op(masi,d.0,d.1), self.fmt_op(masi,s.0,s.1)); } }
+                0x70 => { let d=self.read_op_pair(code,&mut pc); let s=self.read_op_pair(code,&mut pc); if let (Some(d),Some(s))=(d,s){ text=format!("FMOV {} {}", self.fmt_op(masi,d.0,d.1), self.fmt_op(masi,s.0,s.1)); } }
+                0x71 => { let d=self.read_op_pair(code,&mut pc); let s=self.read_op_pair(code,&mut pc); if let (Some(d),Some(s))=(d,s){ text=format!("FADD {} {}", self.fmt_op(masi,d.0,d.1), self.fmt_op(masi,s.0,s.1)); } }
+                0x72 => { let d=self.read_op_pair(code,&mut pc); let s=self.read_op_pair(code,&mut pc); if let (Some(d),Some(s))=(d,s){ text=format!("FSUB {} {}", self.fmt_op(masi,d.0,d.1), self.fmt_op(masi,s.0,s.1)); } }
+                0x73 => { let d=self.read_op_pair(code,&mut pc); let s=self.read_op_pair(code,&mut pc); if let (Some(d),Some(s))=(d,s){ text=format!("FMUL {} {}", self.fmt_op(masi,d.0,d.1), self.fmt_op(masi,s.0,s.1)); } }
+                0x74 => { let d=self.read_op_pair(code,&mut pc); let s=self.read_op_pair(code,&mut pc); if let (Some(d),Some(s))=(d,s){ text=format!("FDIV {} {}", self.fmt_op(masi,d.0,d.1), self.fmt_op(masi,s.0,s.1)); } }
+                0x75 => { let a=self.read_op_pair(code,&mut pc); let b=self.read_op_pair(code,&mut pc); if let (Some(a),Some(b))=(a,b){ text=format!("FCMP {} {}", self.fmt_op(masi,a.0,a.1), self.fmt_op(masi,b.0,b.1)); } }
+                0x76 => { let t=self.read_op_pair(code,&mut pc); if let Some(t)=t{ text=format!("FJE {}", self.fmt_op(masi,t.0,t.1)); } }
+                0x77 => { let t=self.read_op_pair(code,&mut pc); if let Some(t)=t{ text=format!("FJNE {}", self.fmt_op(masi,t.0,t.1)); } }
+                0x78 => { let t=self.read_op_pair(code,&mut pc); if let Some(t)=t{ text=format!("FJLT {}", self.fmt_op(masi,t.0,t.1)); } }
+                0x79 => { let t=self.read_op_pair(code,&mut pc); if let Some(t)=t{ text=format!("FJLE {}", self.fmt_op(masi,t.0,t.1)); } }
+                0x7A => { let t=self.read_op_pair(code,&mut pc); if let Some(t)=t{ text=format!("FJGT {}", self.fmt_op(masi,t.0,t.1)); } }
+                0x7B => { let t=self.read_op_pair(code,&mut pc); if let Some(t)=t{ text=format!("FJGE {}", self.fmt_op(masi,t.0,t.1)); } }
+                0x7C => { let t=self.read_op_pair(code,&mut pc); if let Some(t)=t{ text=format!("FJUO {}", self.fmt_op(masi,t.0,t.1)); } }
+                0x10 => { let t=self.read_op_pair(code,&mut pc); if let Some(t)=t{ text=format!("JMP {}", self.fmt_op(masi,t.0,t.1)); } }
+                0x11 => { let a=self.read_op_pair(code,&mut pc); let b=self.read_op_pair(code,&mut pc); if let (Some(a),Some(b))=(a,b){ text=format!("CMP {} {}", self.fmt_op(masi,a.0,a.1), self.fmt_op(masi,b.0,b.1)); } }
+                0x12 => { let t=self.read_op_pair(code,&mut pc); if let Some(t)=t{ text=format!("JE {}", self.fmt_op(masi,t.0,t.1)); } }
+                0x13 => { let t=self.read_op_pair(code,&mut pc); if let Some(t)=t{ text=format!("JNE {}", self.fmt_op(masi,t.0,t.1)); } }
+                0x14 => { let t=self.read_op_pair(code,&mut pc); if let Some(t)=t{ text=format!("JL {}", self.fmt_op(masi,t.0,t.1)); } }
+                0x15 => { let t=self.read_op_pair(code,&mut pc); if let Some(t)=t{ text=format!("JLE {}", self.fmt_op(masi,t.0,t.1)); } }
+                0x16 => { let t=self.read_op_pair(code,&mut pc); if let Some(t)=t{ text=format!("JG {}", self.fmt_op(masi,t.0,t.1)); } }
+                0x17 => { let t=self.read_op_pair(code,&mut pc); if let Some(t)=t{ text=format!("JGE {}", self.fmt_op(masi,t.0,t.1)); } }
+                0x20 => { let t=self.read_op_pair(code,&mut pc); if let Some(t)=t{ text=format!("CALL {}", self.fmt_op(masi,t.0,t.1)); } }
+                0x21 => { text = "RET".into(); }
+                0x30 => { let v=self.read_op_pair(code,&mut pc); if let Some(v)=v{ text=format!("PUSH {}", self.fmt_op(masi,v.0,v.1)); } }
+                0x31 => { let d=self.read_op_pair(code,&mut pc); if let Some(d)=d{ text=format!("POP {}", self.fmt_op(masi,d.0,d.1)); } }
+                0x40 => { let p=self.read_op_pair(code,&mut pc); let v=self.read_op_pair(code,&mut pc); if let (Some(p),Some(v))=(p,v){ text=format!("OUT {} {}", self.fmt_op(masi,p.0,p.1), self.fmt_op(masi,v.0,v.1)); } }
+                0x41 => { let p=self.read_op_pair(code,&mut pc); let v=self.read_op_pair(code,&mut pc); if let (Some(p),Some(v))=(p,v){ text=format!("COUT {} {}", self.fmt_op(masi,p.0,p.1), self.fmt_op(masi,v.0,v.1)); } }
+                0x42 => { let d=self.read_op_pair(code,&mut pc); if let Some(d)=d{ text=format!("IN {}", self.fmt_op(masi,d.0,d.1)); } }
+                0x50 => { let s=self.read_op_pair(code,&mut pc); if let Some(s)=s{ text=format!("ENTER {}", self.fmt_op(masi,s.0,s.1)); } }
+                0x51 => { text = "LEAVE".into(); }
+                0x60 => {
+                    let m=self.read_op_pair(code,&mut pc); let f=self.read_op_pair(code,&mut pc);
+                    if let (Some(m),Some(f))=(m,f){
+                        if pc + 2 > code.len() { break; }
+                        let mut off = pc; let argc = read_u16_le(code, &mut off) as usize; pc = off;
+                        let mut line = format!("MNI {} {}", self.fmt_op(masi,m.0,m.1), self.fmt_op(masi,f.0,f.1));
+                        for _ in 0..argc { if let Some(a)=self.read_op_pair(code,&mut pc) { line.push(' '); line.push_str(&self.fmt_op(masi,a.0,a.1)); } }
+                        text = line;
+                    }
+                }
+                0x00 => { text = "NOP".into(); }
+                0xFF => { text = "HLT".into(); }
+                _ => { text = format!("; DB 0x{:02X}", opcode); }
+            }
+            let label = masi.label_map.get(&(this_pc as u64)).cloned();
+            let full = if let Some(lbl) = label { format!("{:08X}: {:<8} {}", this_pc, lbl, text) } else { format!("{:08X}: {}", this_pc, text) };
+            lines.push((this_pc, full));
+            n += 1;
+        }
+        lines
+    }
 }
 
 impl Debugger for CliDebugger {
@@ -1271,7 +1686,14 @@ impl Debugger for CliDebugger {
                     } else { println!("usage: x <addr|label> [len]"); }
                 }
                 "help" | "h" => {
-                    println!("Commands: step(s), continue(c), break(b) <addr|label>, delete(db) <addr|label>, info breakpoints, regs, x <addr> [len], quit(q)");
+                    println!("Commands: step(s), continue(c), break(b) <addr|label>, delete(db) <addr|label>, info breakpoints, regs, x <addr> [len], disas [addr] [count], quit(q)");
+                }
+                "disas" | "u" => {
+                    // disassemble: disas [addr] [count]
+                    let addr = parts.next().and_then(|s| self.parse_addr(masi, s)).unwrap_or(pc);
+                    let count = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(10);
+                    let lines = self.disassemble_from(masi, addr, count);
+                    for (_p, l) in lines { println!("{}", l); }
                 }
                 _ => { println!("unknown command: {} (type 'help')", cmd); }
             }

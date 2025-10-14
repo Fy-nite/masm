@@ -2,7 +2,7 @@ param(
     [string] $buildType = "release",
     [string] $targetArch = "x86_64",
     [string] $outputDir = "build",
-    [string] $platform = "windows",
+    [string] $platform = "linux",
     [switch] $clean = $false
 )
 # if linux, cargo build --target x86_64-unknown-linux-gnu
@@ -16,12 +16,18 @@ if ($clean) {
     }
 }
 Write-Host "Building for $platform, $targetArch, $buildType..."
-$env:TARGET = switch ($platform) {
+$env:TARGET = switch ($platform.Trim().ToLower()) {
     "linux" { "$targetArch-unknown-linux-gnu" }
     "windows" { "$targetArch-pc-windows-msvc" }
     default { throw "Unsupported platform: $platform" }
 }
 $env:OUTPUT_DIR = $outputDir
+
+# Ensure buildType is either 'release' or 'debug'
+if ($buildType -ne "release" -and $buildType -ne "debug") {
+    throw "Invalid buildType: $buildType. Must be 'release' or 'debug'."
+}
+
 $buildCmd = "cargo build --target $env:TARGET"
 if ($buildType -eq "release") {
     $buildCmd += " --release"
@@ -37,9 +43,9 @@ foreach ($dir in $dirsToCopy) {
         Copy-Item -Path $dir -Destination $destDir -Recurse -Force
     }
 }
-$binaryExt = switch ($platform) { "windows" { ".exe" } default { "" } }
+$binaryExt = switch ($platform.Trim().ToLower()) { "windows" { ".exe" } default { "" } }
 $binaryName = "masm$binaryExt"
-$sourcePath = "target\$env:TARGET\$buildType\$binaryName"
+$sourcePath = "target/$env:TARGET/$buildType/$binaryName"
 $destPath = Join-Path $outputDir $binaryName
 Copy-Item -Path $sourcePath -Destination $destPath -Force
 Write-Host "Build completed. Binary located at $destPath"

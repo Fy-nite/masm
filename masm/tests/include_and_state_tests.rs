@@ -153,3 +153,18 @@ fn test_mni_missing_returns_error() {
     let msg = res.err().unwrap();
     assert!(msg.contains("MNI: function not found"));
 }
+
+#[test]
+fn test_state_string_directive() {
+    let asm = r#"
+    STATE greeting <STRING> "Hello, world!"
+        MOV R1 greeting
+        MOV R2 $R1
+        COUT 1 R2
+        HLT
+    "#;
+    let (out, err, _state) = run_asm_with_io_state(asm, "");
+    assert_eq!(err, "");
+    // COUT prints without a trailing newline; compare start
+    assert!(out.starts_with("Hello, world!"));
+}
