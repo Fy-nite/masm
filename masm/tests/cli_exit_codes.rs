@@ -20,7 +20,10 @@ fn assemble_nonexistent_file_exits_nonzero() {
         .arg("this_file_does_not_exist.masm")
         .status()
         .expect("failed to run masm");
-    assert!(!status.success(), "expected non-zero exit for missing input");
+    assert!(
+        !status.success(),
+        "expected non-zero exit for missing input"
+    );
 }
 
 #[test]
@@ -29,7 +32,10 @@ fn link_too_few_inputs_exits_nonzero() {
         .args(["link", "a.masi"]) // only one, should require at least two
         .status()
         .expect("failed to run masm");
-    assert!(!status.success(), "expected non-zero exit for invalid link invocation");
+    assert!(
+        !status.success(),
+        "expected non-zero exit for invalid link invocation"
+    );
 }
 
 #[test]
@@ -38,5 +44,8 @@ fn disasm_nonexistent_file_exits_nonzero() {
         .args(["missing.masi", "--disasm"]) // load should fail
         .status()
         .expect("failed to run masm");
-    assert!(!status.success(), "expected non-zero exit for missing masi disasm");
+    assert!(
+        !status.success(),
+        "expected non-zero exit for missing masi disasm"
+    );
 }

@@ -1,4 +1,8 @@
-use masm::{assembler::{assemble_to_masi_with_base, assemble_to_masi}, disassembler::load as load_masi, interpreter::run_masi_with_io};
+use masm::{
+    assembler::{assemble_to_masi, assemble_to_masi_with_base},
+    disassembler::load as load_masi,
+    interpreter::run_masi_with_io,
+};
 use std::io::{Cursor, Read};
 
 fn run_asm_with_io_state(asm: &str, input: &str) -> (String, String, masm::interpreter::State) {
@@ -10,7 +14,8 @@ fn run_asm_with_io_state(asm: &str, input: &str) -> (String, String, masm::inter
     let mut input_reader = Cursor::new(input.as_bytes().to_vec());
     let mut out_buf: Vec<u8> = Vec::new();
     let mut err_buf: Vec<u8> = Vec::new();
-    let state = run_masi_with_io(&masi, &mut out_buf, &mut err_buf, Some(&mut input_reader)).expect("run");
+    let state =
+        run_masi_with_io(&masi, &mut out_buf, &mut err_buf, Some(&mut input_reader)).expect("run");
     let mut out_s = String::new();
     let mut err_s = String::new();
     let _ = Cursor::new(out_buf).read_to_string(&mut out_s);
@@ -19,7 +24,8 @@ fn run_asm_with_io_state(asm: &str, input: &str) -> (String, String, masm::inter
 }
 
 fn run_asm_with_base(asm: &str, base_dir: &std::path::Path) -> (String, String) {
-    let bytes = assemble_to_masi_with_base(asm, &base_dir.to_string_lossy()).expect("assemble with base");
+    let bytes =
+        assemble_to_masi_with_base(asm, &base_dir.to_string_lossy()).expect("assemble with base");
     let mut tmp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(tmp.path(), &bytes).unwrap();
     let masi = load_masi(tmp.path().to_string_lossy().as_ref()).expect("load masi");
@@ -27,7 +33,8 @@ fn run_asm_with_base(asm: &str, base_dir: &std::path::Path) -> (String, String) 
     let mut input_reader = Cursor::new(Vec::<u8>::new());
     let mut out_buf: Vec<u8> = Vec::new();
     let mut err_buf: Vec<u8> = Vec::new();
-    let _ = run_masi_with_io(&masi, &mut out_buf, &mut err_buf, Some(&mut input_reader)).expect("run");
+    let _ =
+        run_masi_with_io(&masi, &mut out_buf, &mut err_buf, Some(&mut input_reader)).expect("run");
     let mut out_s = String::new();
     let mut err_s = String::new();
     let _ = Cursor::new(out_buf).read_to_string(&mut out_s);
@@ -51,7 +58,7 @@ fn test_include_bytes_and_len() {
     let tmpdir = tempfile::tempdir().unwrap();
     let data_path = tmpdir.path().join("data.bin");
     // 8 bytes to form a known u64 value 0x8877665544332211
-    let bytes: [u8;8] = [0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88];
+    let bytes: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
     std::fs::write(&data_path, &bytes).unwrap();
     let asm = format!(
         "#include_bytes data, \"{}\"\n\

@@ -1,13 +1,13 @@
-mod register_map;
 mod assembler;
 mod disassembler;
 mod interpreter;
 mod linker;
+mod register_map;
 
+use interpreter::{CliDebugger, set_thread_debugger};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use interpreter::{CliDebugger, set_thread_debugger};
 
 fn print_usage() {
     eprintln!(
@@ -34,46 +34,103 @@ fn main() {
                 return;
             }
             "-o" => {
-                if let Some(p) = args.next() { output = Some(PathBuf::from(p)); } else { eprintln!("-o requires a file path"); std::process::exit(1); }
+                if let Some(p) = args.next() {
+                    output = Some(PathBuf::from(p));
+                } else {
+                    eprintln!("-o requires a file path");
+                    std::process::exit(1);
+                }
             }
-            "--disasm" | "-x" => { disasm = true; }
-            "--dump" | "-t" => { dump = true; }
-            "--run" | "-r" => { run_flag = true; }
-            "--debug" | "-g" => { debug_mode = true; run_flag = true; }
+            "--disasm" | "-x" => {
+                disasm = true;
+            }
+            "--dump" | "-t" => {
+                dump = true;
+            }
+            "--run" | "-r" => {
+                run_flag = true;
+            }
+            "--debug" | "-g" => {
+                debug_mode = true;
+                run_flag = true;
+            }
             "--stdin-from" => {
-                if let Some(p) = args.next() { stdin_from = Some(PathBuf::from(p)); } else { eprintln!("--stdin-from requires a file path"); std::process::exit(1); }
+                if let Some(p) = args.next() {
+                    stdin_from = Some(PathBuf::from(p));
+                } else {
+                    eprintln!("--stdin-from requires a file path");
+                    std::process::exit(1);
+                }
             }
             _ => {
                 let lower = a.to_lowercase();
-                if lower == "link" { link_mode = true; }
-                else if link_mode {
+                if lower == "link" {
+                    link_mode = true;
+                } else if link_mode {
                     // collect link inputs until -o or end
-                    if lower.starts_with("-") { eprintln!("Unexpected option in link inputs: {}", a); print_usage(); std::process::exit(1); }
+                    if lower.starts_with("-") {
+                        eprintln!("Unexpected option in link inputs: {}", a);
+                        print_usage();
+                        std::process::exit(1);
+                    }
                     link_inputs.push(a);
+                } else if lower.ends_with(".masm") || lower.ends_with(".masi") {
+                    input = Some(PathBuf::from(a));
+                } else {
+                    eprintln!("Unknown argument: {}", a);
+                    print_usage();
+                    std::process::exit(1);
                 }
-                else if lower.ends_with(".masm") || lower.ends_with(".masi") { input = Some(PathBuf::from(a)); }
-                else { eprintln!("Unknown argument: {}", a); print_usage(); std::process::exit(1); }
             }
         }
     }
 
     if link_mode {
-        if link_inputs.len() < 2 { eprintln!("link requires at least two .masi inputs"); std::process::exit(1); }
+        if link_inputs.len() < 2 {
+            eprintln!("link requires at least two .masi inputs");
+            std::process::exit(1);
+        }
         let out_path = output.unwrap_or_else(|| PathBuf::from("out.masi"));
         match linker::link_files(&link_inputs) {
-            Ok(res) => { if let Err(e) = fs::write(&out_path, res.bytes) { eprintln!("Failed to write {}: {}", out_path.display(), e); std::process::exit(1); } else { println!("Linked -> {}", out_path.display()); } }
-            Err(e) => { eprintln!("Link failed: {}", e); std::process::exit(1); },
+            Ok(res) => {
+                if let Err(e) = fs::write(&out_path, res.bytes) {
+                    eprintln!("Failed to write {}: {}", out_path.display(), e);
+                    std::process::exit(1);
+                } else {
+                    println!("Linked -> {}", out_path.display());
+                }
+            }
+            Err(e) => {
+                eprintln!("Link failed: {}", e);
+                std::process::exit(1);
+            }
         }
         return;
     }
 
-    let Some(input_path) = input else { print_usage(); std::process::exit(1); };
-    if input_path.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("masi")).unwrap_or(false) {
+    let Some(input_path) = input else {
+        print_usage();
+        std::process::exit(1);
+    };
+    if input_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.eq_ignore_ascii_case("masi"))
+        .unwrap_or(false)
+    {
         // Run, disassemble, or dump
         let path_str = input_path.to_string_lossy();
-        let masi = match disassembler::load(&path_str) { Ok(m) => m, Err(e) => { eprintln!("Failed to load MASI: {}", e); std::process::exit(1); } };
+        let masi = match disassembler::load(&path_str) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Failed to load MASI: {}", e);
+                std::process::exit(1);
+            }
+        };
         if run_flag || (!disasm && !dump) {
-            if debug_mode { set_thread_debugger(Some(Box::new(CliDebugger::new()))); }
+            if debug_mode {
+                set_thread_debugger(Some(Box::new(CliDebugger::new())));
+            }
             // Route IO via run_masi_with_io to support --stdin-from
             use std::io::{self, BufRead};
             let mut out = io::stdout();
@@ -81,10 +138,18 @@ fn main() {
             let mut file_reader_opt;
             let input_reader: Option<&mut dyn BufRead> = if let Some(path) = stdin_from.as_ref() {
                 match std::fs::File::open(path) {
-                    Ok(f) => { file_reader_opt = Some(io::BufReader::new(f)); file_reader_opt.as_mut().map(|br| br as &mut dyn BufRead) }
-                    Err(e) => { eprintln!("Failed to open {}: {}", path.display(), e); std::process::exit(1); }
+                    Ok(f) => {
+                        file_reader_opt = Some(io::BufReader::new(f));
+                        file_reader_opt.as_mut().map(|br| br as &mut dyn BufRead)
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to open {}: {}", path.display(), e);
+                        std::process::exit(1);
+                    }
                 }
-            } else { None };
+            } else {
+                None
+            };
             match interpreter::run_masi_with_io(&masi, &mut out, &mut err, input_reader) {
                 Ok(state) => {
                     // Print any runtime warnings collected
@@ -92,7 +157,10 @@ fn main() {
                         eprintln!("{}", w);
                     }
                 }
-                Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
             }
             return;
         }
@@ -102,50 +170,94 @@ fn main() {
         }
         if disasm {
             let asm = disassembler::disassemble(&masi);
-            if let Some(out) = output { if let Err(e) = fs::write(&out, asm.as_bytes()) { eprintln!("error: failed to write {}: {}", out.display(), e); std::process::exit(1); } }
-            else { println!("{}", asm); }
+            if let Some(out) = output {
+                if let Err(e) = fs::write(&out, asm.as_bytes()) {
+                    eprintln!("error: failed to write {}: {}", out.display(), e);
+                    std::process::exit(1);
+                }
+            } else {
+                println!("{}", asm);
+            }
             return;
         }
         // unreachable: covered above
     } else {
         // Assemble
-        let src = match fs::read_to_string(&input_path) { Ok(s) => s, Err(e) => { eprintln!("error: failed to read {}: {}", input_path.display(), e); std::process::exit(1); } };
-        let base = input_path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| ".".to_string());
+        let src = match fs::read_to_string(&input_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: failed to read {}: {}", input_path.display(), e);
+                std::process::exit(1);
+            }
+        };
+        let base = input_path
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| ".".to_string());
         match assembler::assemble_to_masi_with_base(&src, &base) {
             Ok(bytes) => {
                 // If run or debug mode requested, run directly; otherwise save to file
                 if run_flag || debug_mode {
                     match disassembler::parse_masi_bytes(&bytes) {
                         Ok(masi) => {
-                            if debug_mode { set_thread_debugger(Some(Box::new(CliDebugger::new()))); }
+                            if debug_mode {
+                                set_thread_debugger(Some(Box::new(CliDebugger::new())));
+                            }
                             use std::io::{self, BufRead};
                             let mut out = io::stdout();
                             let mut err = io::stderr();
                             let mut file_reader_opt;
-                            let input_reader: Option<&mut dyn BufRead> = if let Some(path) = stdin_from.as_ref() {
+                            let input_reader: Option<&mut dyn BufRead> = if let Some(path) =
+                                stdin_from.as_ref()
+                            {
                                 match std::fs::File::open(path) {
-                                    Ok(f) => { file_reader_opt = Some(io::BufReader::new(f)); file_reader_opt.as_mut().map(|br| br as &mut dyn BufRead) }
-                                    Err(e) => { eprintln!("Failed to open {}: {}", path.display(), e); std::process::exit(1); }
+                                    Ok(f) => {
+                                        file_reader_opt = Some(io::BufReader::new(f));
+                                        file_reader_opt.as_mut().map(|br| br as &mut dyn BufRead)
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to open {}: {}", path.display(), e);
+                                        std::process::exit(1);
+                                    }
                                 }
-                            } else { None };
-                            match interpreter::run_masi_with_io(&masi, &mut out, &mut err, input_reader) {
+                            } else {
+                                None
+                            };
+                            match interpreter::run_masi_with_io(
+                                &masi,
+                                &mut out,
+                                &mut err,
+                                input_reader,
+                            ) {
                                 Ok(state) => {
                                     for w in state.warnings.iter() {
                                         eprintln!("{}", w);
                                     }
                                 }
-                                Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+                                Err(e) => {
+                                    eprintln!("{}", e);
+                                    std::process::exit(1);
+                                }
                             }
                         }
-                        Err(e) => { eprintln!("error: failed to load assembled MASI: {}", e); std::process::exit(1); }
+                        Err(e) => {
+                            eprintln!("error: failed to load assembled MASI: {}", e);
+                            std::process::exit(1);
+                        }
                     }
                 } else {
                     let out_path = output.unwrap_or_else(|| PathBuf::from("out.masi"));
-                    if let Err(e) = fs::write(&out_path, bytes) { eprintln!("error: failed to write {}: {}", out_path.display(), e); std::process::exit(1); }
+                    if let Err(e) = fs::write(&out_path, bytes) {
+                        eprintln!("error: failed to write {}: {}", out_path.display(), e);
+                        std::process::exit(1);
+                    }
                     println!("Wrote MASI to {}", out_path.display());
                 }
             }
-            Err(e) => { eprintln!("error: assembly failed: {}", e); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("error: assembly failed: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 }

@@ -1,5 +1,5 @@
-use masm::interpreter::compile_source_to_masi_bytes;
 use masm::disassembler::parse_masi_bytes;
+use masm::interpreter::compile_source_to_masi_bytes;
 
 #[test]
 fn test_compile_and_parse_simple() {
