@@ -65,22 +65,20 @@ if ($editorExe) {
 
 # Build masm (Rust) via cargo as before
 Write-Host "Building masm (cargo) for $platform..."
-Push-Location $masmProj
 if ($buildType -eq "release") { cargo build --release } else { cargo build }
-Pop-Location
 
 # Copy masm binary into tc dir
 switch ($platform) {
     "windows" {
-        $masmBin = Join-Path $masmProj "target\$buildType\masm.exe"
+        $masmBin = "target\$buildType\masm.exe"
         Copy-Item $masmBin (Join-Path $tcDir "masm.exe") -Force
     }
     "linux" {
-        $masmBin = Join-Path $masmProj "target/$buildType/masm"
+        $masmBin = "target/$buildType/masm"
         Copy-Item $masmBin (Join-Path $tcDir "masm.elf") -Force
     }
     "macos" {
-        $masmBin = Join-Path $masmProj "target/$buildType/masm"
+        $masmBin = "target/$buildType/masm"
         Copy-Item $masmBin (Join-Path $tcDir "masm.dylib") -Force
     }
 }
