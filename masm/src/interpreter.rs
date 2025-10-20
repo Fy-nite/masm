@@ -30,6 +30,9 @@ use std::os::raw::{c_char, c_void};
 use libloading::Library;
 use std::cell::RefCell;
 use std::collections::HashSet;
+#[cfg(feature = "raylib_mni")]
+#[path = "mni_raylib.rs"]
+mod mni_raylib;
 
 #[repr(u8)]
 enum Op {
@@ -539,6 +542,9 @@ pub fn run_masi_with_io(
     // initialize shared memory from MASI data
     state.memory = Arc::new(Mutex::new(masi.data.clone()));
     let mut registry = ModuleRegistry::new();
+    // Register built-in MNI modules implemented in Rust
+    #[cfg(feature = "raylib_mni")]
+    mni_raylib::register_raylib_mni(&mut registry);
     
 
 
@@ -1336,7 +1342,7 @@ pub fn run_masi_with_io(
                 }
                 let w: &mut dyn Write = if to_err { err as &mut dyn Write } else { out as &mut dyn Write };
                 match val_mode {
-                    3 | 4 => {
+                    3 => {
                         if let Some(s) = read_c_string(val_val, &state) {
                             let _ = writeln!(w, "{}", s);
                         } else {
@@ -1345,6 +1351,19 @@ pub fn run_masi_with_io(
                                 val_val, state.rip
                             ));
                             let _ = writeln!(w, "{}", val_val);
+                        }
+                    }
+                    4 => {
+                        // Register-indirect: val_val encodes a register id; fetch address from the register first
+                        let addr = state.regs.get(&(val_val as u16)).copied().unwrap_or(0);
+                        if let Some(s) = read_c_string(addr, &state) {
+                            let _ = writeln!(w, "{}", s);
+                        } else {
+                            state.warnings.push(format!(
+                                "warning: OUT read invalid string address $0x{:X}\n  --> pc: 0x{:X}",
+                                addr, state.rip
+                            ));
+                            let _ = writeln!(w, "{}", addr);
                         }
                     }
                     1 => {

@@ -128,6 +128,23 @@ fn test_out_to_stderr() {
 }
 
 #[test]
+fn test_out_string_via_register_indirect() {
+	// Ensure OUT handles $RBX (register-indirect) as a string address correctly.
+	let asm = r#"
+		hello: DB "Hello from temp!", 0
+		MOV RBX hello
+		; Both should print the same string
+		OUT 1 $RBX
+		OUT 1 $[RBX]
+		HLT
+	"#;
+	let (out, err) = run_asm_with_io(asm, "");
+	assert_eq!(err, "");
+	let lines: Vec<&str> = out.lines().collect();
+	assert_eq!(lines, vec!["Hello from temp!", "Hello from temp!"]);
+}
+
+#[test]
 fn test_mni_lua_module_tool_set_rax_and_echo() {
 	// The assembler will materialize constant strings for module/function/args.
 	let asm = r#"

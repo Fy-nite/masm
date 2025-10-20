@@ -1,0 +1,30 @@
+; Test colored rectangles to verify rendering
+lbl main
+    ; init window
+    MNI Raylib.init 800 600 RectTest
+    MNI Raylib.set_target_fps 60
+
+lbl loop
+    ; draw red rectangle
+    MNI Raylib.draw_rectangle 50 50 100 100 255 0 0 255
+    
+    ; draw green rectangle
+    MNI Raylib.draw_rectangle 200 50 100 100 0 255 0 255
+    
+    ; draw blue rectangle  
+    MNI Raylib.draw_rectangle 350 50 100 100 0 0 255 255
+    
+    ; present
+    mov R1 0
+    MNI Raylib.present R1 800 600
+    
+    ; exit on ESC (256)
+    MNI Raylib.is_key_down 256
+    cmp RAX 1
+    je #quit
+    
+    jmp #loop
+
+lbl quit
+    MNI Raylib.close
+    hlt

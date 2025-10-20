@@ -109,13 +109,41 @@ fn main() {
         // unreachable: covered above
     } else {
         // Assemble
-        let out_path = output.unwrap_or_else(|| PathBuf::from("out.masi"));
         let src = match fs::read_to_string(&input_path) { Ok(s) => s, Err(e) => { eprintln!("error: failed to read {}: {}", input_path.display(), e); std::process::exit(1); } };
         let base = input_path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| ".".to_string());
         match assembler::assemble_to_masi_with_base(&src, &base) {
             Ok(bytes) => {
-                if let Err(e) = fs::write(&out_path, bytes) { eprintln!("error: failed to write {}: {}", out_path.display(), e); std::process::exit(1); }
-                println!("Wrote MASI to {}", out_path.display());
+                // If run or debug mode requested, run directly; otherwise save to file
+                if run_flag || debug_mode {
+                    match disassembler::parse_masi_bytes(&bytes) {
+                        Ok(masi) => {
+                            if debug_mode { set_thread_debugger(Some(Box::new(CliDebugger::new()))); }
+                            use std::io::{self, BufRead};
+                            let mut out = io::stdout();
+                            let mut err = io::stderr();
+                            let mut file_reader_opt;
+                            let input_reader: Option<&mut dyn BufRead> = if let Some(path) = stdin_from.as_ref() {
+                                match std::fs::File::open(path) {
+                                    Ok(f) => { file_reader_opt = Some(io::BufReader::new(f)); file_reader_opt.as_mut().map(|br| br as &mut dyn BufRead) }
+                                    Err(e) => { eprintln!("Failed to open {}: {}", path.display(), e); std::process::exit(1); }
+                                }
+                            } else { None };
+                            match interpreter::run_masi_with_io(&masi, &mut out, &mut err, input_reader) {
+                                Ok(state) => {
+                                    for w in state.warnings.iter() {
+                                        eprintln!("{}", w);
+                                    }
+                                }
+                                Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+                            }
+                        }
+                        Err(e) => { eprintln!("error: failed to load assembled MASI: {}", e); std::process::exit(1); }
+                    }
+                } else {
+                    let out_path = output.unwrap_or_else(|| PathBuf::from("out.masi"));
+                    if let Err(e) = fs::write(&out_path, bytes) { eprintln!("error: failed to write {}: {}", out_path.display(), e); std::process::exit(1); }
+                    println!("Wrote MASI to {}", out_path.display());
+                }
             }
             Err(e) => { eprintln!("error: assembly failed: {}", e); std::process::exit(1); }
         }

@@ -1,0 +1,29 @@
+; Text test with colored background
+lbl main
+    msg: db "Hello World!"
+    
+    ; init window
+    MNI Raylib.init 400 300 TextTest
+    MNI Raylib.set_target_fps 60
+
+lbl loop
+    ; draw gray background rectangle
+    MNI Raylib.draw_rectangle 40 40 300 50 100 100 100 255
+    
+    ; draw text at (50, 50)
+    MNI Raylib.draw_text 50 50 20 255 0 0 255 $msg 12
+    
+    ; present
+    mov R1 0
+    MNI Raylib.present R1 400 300
+    
+    ; exit on ESC (256)
+    MNI Raylib.is_key_down 256
+    cmp RAX 1
+    je #quit
+    
+    jmp #loop
+
+lbl quit
+    MNI Raylib.close
+    hlt

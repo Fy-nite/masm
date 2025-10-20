@@ -1,0 +1,78 @@
+; Simple Text Editor Demo with MASM + Raylib
+; Draws text on a black background
+; Type characters to see them appear
+; Press Backspace to delete, 'C' to clear, ESC to exit
+
+lbl main
+    text_buffer: resb 128  ; Reserve 128 bytes for text input
+
+    ; R5 = text buffer address
+    mov R5 text_buffer
+    mov R6 0         ; R6 = text length (number of chars)
+
+    ; init window and set fps
+    MNI Raylib.init 1024 768 TextEditor
+    MNI Raylib.set_target_fps 60
+
+lbl loop
+    ; Draw a white rectangle as background for text
+    MNI Raylib.draw_rectangle 10 10 1000 100 50 50 50 255
+    
+    ; draw text on black background
+    MNI Raylib.draw_text 20 20 24 255 255 255 255 R5 R6
+
+    ; present to screen
+    mov R1 0
+    MNI Raylib.present R1 1024 768
+
+    ; capture keyboard input
+    MNI Raylib.get_key_pressed
+    mov R8 RAX       ; R8 = key code
+
+    ; check for backspace (259)
+    cmp R8 259
+    je #handle_backspace
+
+    ; check for 'C' to clear (67)
+    cmp R8 67
+    je #handle_clear
+
+    ; check for printable ASCII (32-126)
+    cmp R8 32
+    jl #skip_char
+    cmp R8 126
+    jg #skip_char
+
+    ; check if buffer has space (R6 < 128)
+    cmp R6 127
+    jge #skip_char
+
+    ; add character to text buffer
+    mov R7 R5        ; R7 = buffer base address
+    add R7 R6        ; R7 = buffer base + length
+    mov [R7] R8      ; store character at buffer+length
+    inc R6           ; increment length
+    jmp #skip_char
+
+lbl handle_backspace
+    ; remove last character
+    cmp R6 0
+    je #skip_char
+    dec R6
+    jmp #skip_char
+
+lbl handle_clear
+    ; clear text buffer
+    mov R6 0
+    jmp #skip_char
+
+lbl skip_char
+    ; exit on ESC (256)
+    MNI Raylib.is_key_down 256
+    cmp RAX 1
+    je #quit
+    jmp #loop
+
+lbl quit
+    MNI Raylib.close
+    hlt
