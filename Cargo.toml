@@ -1,7 +1,5 @@
 [workspace]
-members = [
-    "masm",
-]
+members = ["masm"]
 
 # Optional workspace metadata
 [workspace.metadata]
