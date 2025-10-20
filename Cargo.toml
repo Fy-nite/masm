@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "masm",
+]
+
+# Optional workspace metadata
+[workspace.metadata]
+description = "Workspace for masm project; primary crate is in the `masm` directory."
