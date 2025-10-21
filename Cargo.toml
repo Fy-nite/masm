@@ -1,5 +1,6 @@
 [workspace]
 members = ["masm"]
+resolver = "3"
 
 # Optional workspace metadata
 [workspace.metadata]
