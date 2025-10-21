@@ -1,0 +1,175 @@
+; Simple Raylib terminal example (compatible registers/instructions)
+
+lbl main
+    ; allocate pixel buffer
+    MNI Memory.allocate 307200
+    mov R2 320
+    mov R3 240
+
+    MNI Raylib.init 320 240 MASM_Terminal
+    MNI Raylib.set_target_fps 60
+    MNI Raylib.clear_buffer R1 R2 R3 0 0 0 255
+
+    ; states
+    state input_buf <PTR>
+    state input_len <QWORD> 0
+    state hist_base <PTR>
+
+    ; allocate history area (5*64)
+    mov R4 320
+    MNI Memory.allocate R4
+    mov hist_base R1
+
+    ; set input_buf = hist_base + 256
+    mov R5 hist_base
+    add R5 256
+    mov input_buf R5
+
+    mov R6 0    ; stored count
+    mov R7 0    ; next slot index
+
+lbl loop
+    MNI Raylib.draw_rectangle 0 0 320 240 0 0 0 255
+
+    ; draw history (0..R6-1)
+    mov R8 0
+    cmp R6 0
+    je #no_hist
+lbl hist_loop
+    cmp R8 R6
+    je #no_hist
+    ; idx = (R7 + R6 - 1 - R8) % 5
+    mov R9 R7
+    add R9 R6
+    sub R9 1
+    sub R9 R8
+lbl idx_mod
+    cmp R9 5
+    jl #idx_mod_done
+    sub R9 5
+    jmp #idx_mod
+lbl idx_mod_done
+    ; compute slot addr = hist_base + R9*64 via repeated add
+    mov R10 hist_base
+    mov R11 0
+lbl slot_mul64
+    cmp R11 R9
+    je #slot_mul64_done
+    add R10 64
+    inc R11
+    jmp #slot_mul64
+lbl slot_mul64_done
+    mov R12 [R10]    ; length
+    cmp R12 0
+    je #skip_line
+    add R10 1
+    ; y = 6 + R8*18  (compute R8*18 = R8*10 + R8*8)
+    mov R13 6
+    mov R14 R8
+    mov R15 0
+lbl mul10_loop
+    cmp R15 10
+    je #mul10_done
+    add R14 R8
+    inc R15
+    jmp #mul10_loop
+lbl mul10_done
+    add R13 R14
+    MNI Raylib.draw_text 4 R13 14 200 200 200 255 R10 R12
+lbl skip_line
+    inc R8
+    jmp #hist_loop
+lbl no_hist
+
+    ; input area
+    MNI Raylib.draw_rectangle 0 216 320 24 30 30 30 255
+    prompt: db "masm> ", 0
+    MNI Raylib.draw_text 4 220 14 180 180 180 255 $prompt 7
+
+    mov R5 input_buf
+    mov R6 input_len
+    MNI Raylib.draw_text 64 220 14 220 220 220 255 R5 R6
+
+    MNI Raylib.present R1 320 240
+
+    MNI Raylib.get_key_pressed
+    mov R8 RAX
+    cmp R8 0
+    je #skip
+    cmp R8 259
+    je #backspace
+    cmp R8 257
+    je #enter
+    cmp R8 32
+    jl #skip
+    cmp R8 126
+    jg #skip
+    mov R9 input_len
+    cmp R9 63
+    jge #skip
+    mov R10 input_buf
+    add R10 input_len
+    mov [R10] R8
+    inc input_len
+    jmp #skip
+
+lbl backspace
+    cmp input_len 0
+    je #skip
+    dec input_len
+    mov R5 input_buf
+    add R5 input_len
+    mov [R5] 0
+    jmp #skip
+
+lbl enter
+    mov R9 input_len
+    ; dest = hist_base + R7*64
+    mov R10 hist_base
+    mov R11 0
+lbl slot_add_loop
+    cmp R11 R7
+    je #slot_add_done
+    add R10 64
+    inc R11
+    jmp #slot_add_loop
+lbl slot_add_done
+    mov [R10] R9
+    ; copy bytes
+    mov R11 0
+lbl copy_loop
+    cmp R11 R9
+    je #copy_done
+    mov R12 input_buf
+    add R12 R11
+    mov R13 [R12]
+    mov R14 R10
+    add R14 1
+    add R14 R11
+    mov [R14] R13
+    inc R11
+    jmp #copy_loop
+lbl copy_done
+    inc R7
+    cmp R7 5
+    jl #after_inc
+    mov R7 0
+lbl after_inc
+    cmp R6 5
+    je #reset_in
+    inc R6
+lbl reset_in
+    mov input_len 0
+    mov R5 input_buf
+    mov [R5] 0
+    jmp #skip
+
+lbl skip
+    MNI Raylib.is_key_down 256
+    cmp RAX 1
+    je #quit
+    jmp #loop
+
+lbl quit
+    MNI Raylib.close
+    hlt

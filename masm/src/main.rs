@@ -8,6 +8,10 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use interpreter::{CliDebugger, set_thread_debugger};
+#[cfg(feature = "ratatui_debug")]
+mod ratatui_debugger;
+#[cfg(feature = "ratatui_debug")]
+use ratatui_debugger::RatatuiDebugger;
 
 fn print_usage() {
     eprintln!(
@@ -73,7 +77,12 @@ fn main() {
         let path_str = input_path.to_string_lossy();
         let masi = match disassembler::load(&path_str) { Ok(m) => m, Err(e) => { eprintln!("Failed to load MASI: {}", e); std::process::exit(1); } };
         if run_flag || (!disasm && !dump) {
-            if debug_mode { set_thread_debugger(Some(Box::new(CliDebugger::new()))); }
+            if debug_mode {
+                #[cfg(feature = "ratatui_debug")]
+                { set_thread_debugger(Some(Box::new(RatatuiDebugger::new()))); }
+                #[cfg(not(feature = "ratatui_debug"))]
+                { set_thread_debugger(Some(Box::new(interpreter::TuiDebugger::new()))); }
+            }
             // Route IO via run_masi_with_io to support --stdin-from
             use std::io::{self, BufRead};
             let mut out = io::stdout();
@@ -117,7 +126,12 @@ fn main() {
                 if run_flag || debug_mode {
                     match disassembler::parse_masi_bytes(&bytes) {
                         Ok(masi) => {
-                            if debug_mode { set_thread_debugger(Some(Box::new(CliDebugger::new()))); }
+                            if debug_mode {
+                                #[cfg(feature = "ratatui_debug")]
+                                { set_thread_debugger(Some(Box::new(RatatuiDebugger::new()))); }
+                                #[cfg(not(feature = "ratatui_debug"))]
+                                { set_thread_debugger(Some(Box::new(CliDebugger::new()))); }
+                            }
                             use std::io::{self, BufRead};
                             let mut out = io::stdout();
                             let mut err = io::stderr();

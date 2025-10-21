@@ -4,42 +4,69 @@ lbl main
     
     ; init window
     MNI Raylib.init 400 300 TextTest
-    MNI Raylib.set_target_fps 60
-
-lbl skip_x_reverse
+    ;MNI Raylib.set_target_fps 60
+; initialize positions and velocities
     mov R10 0  ; X position
     mov R11 0  ; Y position
-    mov R12 0  ; X direction
-    mov R13 0  ; Y direction
-
-
+    mov R12 1  ; X velocity (+1)
+    mov R13 1  ; Y velocity (+1)
+    mov R14 0  ; scratch reg for negation
 
 lbl loop
-    ; draw text at (50, 50)
+    ; draw the box (uses existing draw_rectangle MNI signature)
     MNI Raylib.draw_rectangle R10 R11 20 20 255 255 255 $msg 12
 
-    ; update position
-
-    inc R10
-    inc R11
-    cmp R10 380
-    jl #skip_x_reverse
-    mov R10 0
-    
-    ; present
+    ; present frame
     mov R1 0
-
     MNI Raylib.present R1 400 300
 
     ; exit on ESC (256)
     MNI Raylib.is_key_down 256
     cmp RAX 1
     je #quit
-    
+
+    ; update positions: x += vx ; y += vy
+    add R10 R12
+    add R11 R13
+
+    ; X bounds check: right side (window width - box width) = 400 - 100? original used 300
+    cmp R10 300
+    jle #check_left_x
+    ; R10 > 300 -> reverse X velocity and clamp
+    mov R14 0
+    sub R14 R12   ; R14 = -R12
+    mov R12 R14
+    mov R10 300
+
+lbl check_left_x
+    cmp R10 0
+    jge #check_y
+    ; R10 < 0 -> reverse X velocity and clamp to 0
+    mov R14 0
+    sub R14 R12
+    mov R12 R14
+    mov R10 0
+
+lbl check_y
+    ; Y bounds check: bottom = 300 - box height (used 280 previously)
+    cmp R11 280
+    jle #loop_continue
+    ; R11 > 280 -> reverse Y velocity and clamp
+    mov R14 0
+    sub R14 R13
+    mov R13 R14
+    mov R11 280
+
+lbl loop_continue
+    cmp R11 0
+    jge #loop
+    ; R11 < 0 -> reverse Y velocity and clamp to 0
+    mov R14 0
+    sub R14 R13
+    mov R13 R14
+    mov R11 0
+
     jmp #loop
-
-
-
 
 lbl quit
     MNI Raylib.close
