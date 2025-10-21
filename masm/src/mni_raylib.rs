@@ -209,7 +209,10 @@ pub fn register_raylib_mni(reg: &mut ModuleRegistry) {
                 0
             }
         });
-       if let Some(rax) = crate::register_map::RegisterMap::build_name_to_id().get("RAX").copied() {
+        if let Some(rax) = crate::register_map::RegisterMap::build_name_to_id()
+            .get("RAX")
+            .copied()
+        {
             _ctx.state.regs.insert(rax, fps as u64);
         }
     });
@@ -222,7 +225,10 @@ pub fn register_raylib_mni(reg: &mut ModuleRegistry) {
                 0.0
             }
         });
-       if let Some(rax) = crate::register_map::RegisterMap::build_name_to_id().get("FP0").copied() {
+        if let Some(rax) = crate::register_map::RegisterMap::build_name_to_id()
+            .get("FP0")
+            .copied()
+        {
             _ctx.state.regs.insert(rax, dt.to_bits() as u64);
         }
     });
