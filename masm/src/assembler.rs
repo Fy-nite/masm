@@ -4,7 +4,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 // Minimal MASI opcodes, mirrored from Swift
-#[allow(dead_code)]
 #[repr(u8)]
 enum Op {
     Mov = 0x01,
@@ -135,7 +134,6 @@ enum DataDirective {
     },
 }
 
-#[allow(dead_code)]
 fn is_register(s: &str, reg_map: &HashMap<String, u16>) -> bool {
     reg_map.contains_key(&s.to_uppercase())
 }
@@ -1024,7 +1022,6 @@ fn emit_operand_into(
     }
 }
 
-#[allow(dead_code)]
 pub fn assemble_to_masi(src: &str) -> Result<Vec<u8>, String> {
     let reg_map = RegisterMap::build_name_to_id();
     // Expand includes first to error early on missing files

@@ -45,7 +45,6 @@ pub struct ExportSym {
     pub offset: u64,
 }
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct ImportRef {
     pub section: u8,
     pub offset: u64,

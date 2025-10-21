@@ -1,5 +1,4 @@
 // Debug printing macro, controlled by DEBUG_PRINT flag
-#[allow(unused_macros)]
 macro_rules! debug_println {
     ($($arg:tt)*) => {
         if cfg!(feature = "debug_print") || DEBUG_PRINT.load(std::sync::atomic::Ordering::Relaxed) {

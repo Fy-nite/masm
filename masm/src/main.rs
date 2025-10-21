@@ -1,8 +1,12 @@
+#![allow(dead_code)]
 mod assembler;
 mod disassembler;
 mod interpreter;
 mod linker;
 mod register_map;
+//#[cfg(feature = "raylib_mni")]
+//pub mod mni_raylib;
+
 
 use interpreter::{CliDebugger, set_thread_debugger};
 use std::env;
