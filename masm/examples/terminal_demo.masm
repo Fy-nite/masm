@@ -1,0 +1,35 @@
+; Simple terminal demo for MASM
+; Prints a prompt, reads a line from stdin into a buffer, echoes it back,
+; and quits when the line starts with the character 'q'.
+
+LBL main
+    ; Static strings
+    prompt: DB "masm> ", 0
+    bye: DB "Goodbye!", 0
+
+    ; Input buffer
+    buf: RESB 256
+
+; Main REPL loop
+LBL repl
+    ; Print prompt
+    OUT 1 $prompt
+
+    ; Read a line (stores trailing '\n' and a terminating '\0')
+    IN $buf
+
+    ; Check first byte of buffer: if it's 'q' (113) then quit
+    MOV R1 buf      ; R1 = address of buf
+    MOV R2 $R1      ; R2 = qword loaded from buf (we only need low byte)
+    AND R2 255      ; mask low byte
+    CMP R2 113      ; 'q' ascii = 113
+    JE #quit
+
+    ; Echo the input line back to stdout
+    OUT 1 $buf
+
+    JMP #repl
+
+LBL quit
+    OUT 1 $bye
+    HLT

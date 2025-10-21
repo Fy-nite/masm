@@ -11,6 +11,11 @@ use interpreter::{CliDebugger, set_thread_debugger};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use interpreter::{CliDebugger, set_thread_debugger};
+#[cfg(feature = "ratatui_debug")]
+mod ratatui_debugger;
+#[cfg(feature = "ratatui_debug")]
+use ratatui_debugger::RatatuiDebugger;
 
 fn print_usage() {
     eprintln!(
@@ -132,7 +137,10 @@ fn main() {
         };
         if run_flag || (!disasm && !dump) {
             if debug_mode {
-                set_thread_debugger(Some(Box::new(CliDebugger::new())));
+                #[cfg(feature = "ratatui_debug")]
+                { set_thread_debugger(Some(Box::new(RatatuiDebugger::new()))); }
+                #[cfg(not(feature = "ratatui_debug"))]
+                { set_thread_debugger(Some(Box::new(interpreter::TuiDebugger::new()))); }
             }
             // Route IO via run_masi_with_io to support --stdin-from
             use std::io::{self, BufRead};
@@ -204,7 +212,10 @@ fn main() {
                     match disassembler::parse_masi_bytes(&bytes) {
                         Ok(masi) => {
                             if debug_mode {
-                                set_thread_debugger(Some(Box::new(CliDebugger::new())));
+                                #[cfg(feature = "ratatui_debug")]
+                                { set_thread_debugger(Some(Box::new(RatatuiDebugger::new()))); }
+                                #[cfg(not(feature = "ratatui_debug"))]
+                                { set_thread_debugger(Some(Box::new(CliDebugger::new()))); }
                             }
                             use std::io::{self, BufRead};
                             let mut out = io::stdout();

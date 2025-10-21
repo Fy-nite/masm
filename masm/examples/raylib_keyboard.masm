@@ -1,0 +1,234 @@
+; Raylib Terminal Demo for MASM (rewritten)
+; - Single-line input
+; - Backspace deletes
+; - Enter stores line in 5-line history (circular)
+; - ESC quits
+
+lbl main
+    ; Allocate pixel buffer: width * height * 4 (RGBA) = 320*240*4 = 307200
+    MNI Memory.allocate 307200
+    mov R2 RAX        ; R2 = pixel buffer base addr (important: use RAX)
+
+    mov R3 320        ; width
+    mov R4 240        ; height
+
+    ; init window and set fps
+    MNI Raylib.init 320 240 MASM_Terminal
+    MNI Raylib.set_target_fps 60
+    MNI Raylib.clear_buffer R2 R3 R4 0 0 0 255
+
+    ; Input buffer (address in input_buf), length in input_len
+    state input_buf <PTR>
+    state input_len <QWORD> 0
+
+    ; Reserve history area: 5 slots x 64 bytes = 320 bytes
+    state hist_base <PTR>
+    mov R10 320
+    MNI Memory.allocate R10
+    mov hist_base RAX
+    ; zero the history area first byte etc. (optional)
+    mov R14 0
+    mov R13 hist_base
+    mov [R13] R14
+
+    mov R11 0    ; R11 = number of stored lines (0..5)
+    mov R12 0    ; R12 = next history slot index (0..4)
+
+    ; Place input string at hist_base + 256 (last 64 bytes)
+    mov R30 hist_base
+    add R30 256
+    mov input_buf R30
+    mov input_len 0
+    mov [R30] 0
+
+lbl loop
+    ; Draw background
+    MNI Raylib.draw_rectangle 0 0 320 240 0 0 0 255
+
+    ; Draw history lines (from oldest to newest, up to R11 lines)
+    mov R15 0           ; line counter (0..R11-1)
+    cmp R11 0
+    je #no_history_draw
+lbl hist_loop
+    cmp R15 R11
+    je #no_history_draw
+    ; slot index = (R12 + R11 - 1 - R15) % 5  (oldest-first)
+    mov R16 R12
+    add R16 R11
+    sub R16 1
+    sub R16 R15
+    mov R17 5
+lbl mod_loop_1
+    cmp R16 R17
+    jl #mod_done_1
+    sub R16 R17
+    jmp #mod_loop_1
+lbl mod_done_1
+    
+    ; compute slot base = hist_base + R16*64
+    mov R18 hist_base
+    mov R19 R16
+    ; compute R19 = R19 * 64 by doubling 6 times
+    mov R14 0
+lbl mul64_loop_1
+    cmp R14 6
+    je #mul64_done_1
+    add R19 R19
+    inc R14
+    jmp #mul64_loop_1
+lbl mul64_done_1
+    add R18 R19
+    ; load length at slot (first byte)
+    mov R20 [R18]       ; length
+    cmp R20 0
+    je #skip_draw_line
+    add R18 1           ; text addr = slot+1
+    ; compute y = 6 + R15*18
+    mov R21 6
+    mov R22 R15
+    ; compute R22 = R22 * 18 = R22*16 + R22*2
+    mov R23 R22       ; save original
+    mov R24 R22
+    mov R14 0
+lbl mul16_loop_2
+    cmp R14 4
+    je #mul16_done_2
+    add R24 R24
+    inc R14
+    jmp #mul16_loop_2
+lbl mul16_done_2
+    ; R24 = R22 * 16
+    add R24 R23       ; +1 -> *17
+    add R24 R23       ; +1 -> *18
+    mov R22 R24
+    add R21 R22
+    MNI Raylib.draw_text 4 R21 14 200 200 200 255 R18 R20
+
+lbl skip_draw_line
+    inc R15
+    jmp #hist_loop
+
+lbl no_history_draw
+
+    ; Draw input area background
+    MNI Raylib.draw_rectangle 0 216 320 24 30 30 30 255
+
+    ; Prompt string
+    prompt: db "masm> ", 0
+    MNI Raylib.draw_text 4 220 14 180 180 180 255 $prompt 7
+
+    ; Draw current input
+    mov R30 input_buf
+    mov R31 input_len
+    MNI Raylib.draw_text 64 220 14 220 220 220 255 R30 R31
+
+    ; Present frame (use pixel buffer R2)
+    MNI Raylib.present R2 320 240
+
+    ; Get key pressed (key code in RAX)
+    MNI Raylib.get_key_pressed
+    mov R8 RAX
+
+    cmp R8 0
+    je #check_quit
+
+    ; Handle Backspace (259)
+    cmp R8 259
+    je #handle_backspace
+
+    ; Handle Enter (257)
+    cmp R8 257
+    je #handle_enter
+
+    ; Accept printable ASCII 32..126
+    cmp R8 32
+    jl #skip_char
+    cmp R8 126
+    jg #skip_char
+
+    ; ensure input_len < 63 (reserve 1 byte for zero or future)
+    mov R9 input_len
+    cmp R9 63
+    jge #skip_char
+
+    ; store byte at input_buf + input_len
+    mov R10 input_buf
+    add R10 input_len
+    mov [R10] R8
+    inc input_len
+    jmp #skip_char
+
+lbl handle_backspace
+    cmp input_len 0
+    je #skip_char
+    dec input_len
+    ; optional: zero out last char
+    mov R30 input_buf
+    add R30 input_len
+    mov [R30] 0
+    jmp #skip_char
+
+lbl handle_enter
+    ; copy input_len (R23)
+    mov R23 input_len
+    ; compute dest = hist_base + R12*64
+    mov R24 hist_base
+    mov R25 R12
+    ; compute R25 = R25 * 64 by doubling 6 times
+    mov R14 0
+lbl mul64_loop_3
+    cmp R14 6
+    je #mul64_done_3
+    add R25 R25
+    inc R14
+    jmp #mul64_loop_3
+lbl mul64_done_3
+    add R24 R25
+    ; store length as first byte
+    mov [R24] R23
+    ; copy bytes input_buf -> (R24+1) for R23 bytes
+    mov R26 0
+    cmp R26 R23
+    je #skip_copy
+lbl copy_loop
+    mov R27 input_buf
+    add R27 R26
+    mov R28 [R27]
+    mov R29 R24
+    add R29 1
+    add R29 R26
+    mov [R29] R28
+    inc R26
+    cmp R26 R23
+    jl #copy_loop
+
+lbl skip_copy
+    ; advance history slot index (circular 0..4)
+    inc R12
+    cmp R12 5
+    jl #after_inc_slot
+    mov R12 0
+lbl after_inc_slot
+    ; increment stored count up to 5
+    cmp R11 5
+    je #reset_input
+    inc R11
+lbl reset_input
+    ; reset input_len to 0
+    mov input_len 0
+    ; zero-out first byte of input_buf for cleanliness
+    mov R30 input_buf
+    mov [R30] 0
+    jmp #skip_char
+
+lbl skip_char
+    ; Exit on ESC key held down (256)
+    MNI Raylib.is_key_down 256
+    cmp RAX 1
+    je #quit
+
+    jmp #loop
+
+lbl quit
+    MNI Raylib.close
+    hlt

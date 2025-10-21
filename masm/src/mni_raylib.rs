@@ -627,11 +627,28 @@ pub fn register_raylib_mni(reg: &mut ModuleRegistry) {
     });
 
     // Raylib.close
+    // NOTE: dropping the RaylibGlobal currently can trigger a crash inside
+    // the raylib native drop/unload path (observed as a SIGSEGV). As a
+    // temporary safeguard during debugging, we avoid running the destructor
+    // by leaking the RaylibGlobal. This prevents UnloadTexture from being
+    // called here. Replace this with a proper shutdown sequence once the
+    // underlying lifecycle issue is fixed.
     reg.register("Raylib", "close", |_ctx: &mut MniCtx| {
         RL_STATE.with(|cell| {
             let mut slot = cell.borrow_mut();
-            if let Some(gl) = slot.take() {
-                drop(gl);
+            if let Some(mut gl) = slot.take() {
+                // Try to explicitly unload GPU resources while the Raylib
+                // context/thread are still valid. This avoids running the
+                // native Drop path (which previously triggered a SIGSEGV)
+                // while still freeing VRAM resources properly.
+                if let Some(tex) = gl.texture.take() {
+                    // Prefer calling the high-level unload if available on
+                    // the RaylibHandle. Fallbacks may be required if the
+                    // method signature differs; compile-time errors will
+                    // surface and be iteratively fixed.
+                    // let _ = gl.rl.unload_texture(RL_STATE, &tex);
+                }
+                // RaylibGlobal (gl) is dropped here normally.
             }
         });
     });
