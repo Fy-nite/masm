@@ -1,0 +1,47 @@
+; Simple dvd logo
+lbl main
+    msg: db "Hello World!"
+    
+    ; init window
+    MNI Raylib.init 400 300 TextTest
+    MNI Raylib.set_target_fps 60
+
+lbl skip_x_reverse
+    mov R10 0  ; X position
+    mov R11 0  ; Y position
+    mov R12 0  ; X direction
+    mov R13 0  ; Y direction
+
+
+
+lbl loop
+    ; draw text at (50, 50)
+    MNI Raylib.draw_rectangle R10 R11 20 20 255 255 255 $msg 12
+
+    ; update position
+
+    inc R10
+    inc R11
+    cmp R10 380
+    jl #skip_x_reverse
+    mov R10 0
+    
+    ; present
+    mov R1 0
+
+    MNI Raylib.present R1 400 300
+
+    ; exit on ESC (256)
+    MNI Raylib.is_key_down 256
+    cmp RAX 1
+    je #quit
+    
+    jmp #loop
+
+
+
+
+lbl quit
+    MNI Raylib.close
+    hlt
+

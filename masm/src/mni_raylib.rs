@@ -201,7 +201,31 @@ pub fn register_raylib_mni(reg: &mut ModuleRegistry) {
             }
         });
     });
-
+    reg.register("Raylib", "show_fps", |_ctx: &mut MniCtx| {
+        let fps = RL_STATE.with(|cell| {
+            if let Some(gl) = cell.borrow_mut().as_mut() {
+                gl.rl.get_fps()
+            } else {
+                0
+            }
+        });
+       if let Some(rax) = crate::register_map::RegisterMap::build_name_to_id().get("RAX").copied() {
+            _ctx.state.regs.insert(rax, fps as u64);
+        }
+    });
+    // delta time
+    reg.register("Raylib", "get_delta_time", |_ctx: &mut MniCtx| {
+        let dt = RL_STATE.with(|cell| {
+            if let Some(gl) = cell.borrow_mut().as_mut() {
+                gl.rl.get_frame_time()
+            } else {
+                0.0
+            }
+        });
+       if let Some(rax) = crate::register_map::RegisterMap::build_name_to_id().get("FP0").copied() {
+            _ctx.state.regs.insert(rax, dt.to_bits() as u64);
+        }
+    });
     // Raylib.draw_rectangle_lines x y w h thickness r g b a
     // Queues rectangle outline drawing command
     reg.register("Raylib", "draw_rectangle_lines", |ctx: &mut MniCtx| {
