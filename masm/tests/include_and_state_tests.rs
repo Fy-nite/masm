@@ -7,7 +7,7 @@ use std::io::{Cursor, Read};
 
 fn run_asm_with_io_state(asm: &str, input: &str) -> (String, String, masm::interpreter::State) {
     let bytes = assemble_to_masi(asm).expect("assemble");
-    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(tmp.path(), &bytes).unwrap();
     let masi = load_masi(tmp.path().to_string_lossy().as_ref()).expect("load masi");
 
@@ -26,7 +26,7 @@ fn run_asm_with_io_state(asm: &str, input: &str) -> (String, String, masm::inter
 fn run_asm_with_base(asm: &str, base_dir: &std::path::Path) -> (String, String) {
     let bytes =
         assemble_to_masi_with_base(asm, &base_dir.to_string_lossy()).expect("assemble with base");
-    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(tmp.path(), &bytes).unwrap();
     let masi = load_masi(tmp.path().to_string_lossy().as_ref()).expect("load masi");
 
@@ -149,7 +149,7 @@ fn test_mni_missing_returns_error() {
         HLT
     "#;
     let bytes = assemble_to_masi(asm).expect("assemble");
-    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(tmp.path(), &bytes).unwrap();
     let masi = load_masi(tmp.path().to_string_lossy().as_ref()).expect("load masi");
     let mut input_reader = Cursor::new(Vec::<u8>::new());

@@ -7,7 +7,7 @@ fn run_asm_with_io(asm: &str, input: &str) -> (String, String) {
     let bytes = assemble_to_masi(asm).expect("assemble");
     // Write to a temp file-like buffer then parse as MASIFile via load() requires a path; instead we construct MASIFile by loading from bytes.
     // But disassembler::load expects a path; to avoid touching disk, we mimic the file layout reader by writing to temp file.
-    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    let tmp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(tmp.path(), &bytes).unwrap();
     let masi = load_masi(tmp.path().to_string_lossy().as_ref()).expect("load masi");
 
