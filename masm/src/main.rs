@@ -11,7 +11,6 @@ use interpreter::{CliDebugger, set_thread_debugger};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use interpreter::{CliDebugger, set_thread_debugger};
 #[cfg(feature = "ratatui_debug")]
 mod ratatui_debugger;
 #[cfg(feature = "ratatui_debug")]
