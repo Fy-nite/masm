@@ -140,19 +140,34 @@ pub struct TuiDebugger {
 }
 
 impl TuiDebugger {
-    pub fn new() -> Self { Self { continue_mode: std::cell::Cell::new(false) } }
+    pub fn new() -> Self {
+        Self {
+            continue_mode: std::cell::Cell::new(false),
+        }
+    }
 }
 
 impl Debugger for TuiDebugger {
-    fn before_execute(&mut self, _masi: &MASIFile, state: &State, pc: usize, opcode: u8) -> DebuggerControl {
+    fn before_execute(
+        &mut self,
+        _masi: &MASIFile,
+        state: &State,
+        pc: usize,
+        opcode: u8,
+    ) -> DebuggerControl {
         // If already in continue mode, do nothing
-        if self.continue_mode.get() { return DebuggerControl::Continue; }
+        if self.continue_mode.get() {
+            return DebuggerControl::Continue;
+        }
 
         // Print a compact status line and prompt for a single-key command.
         // Use crossterm event read to capture one keypress without requiring Enter.
-        println!("[DBG] RIP=0x{:X} PC={} OPCODE=0x{:02X}", state.rip, pc, opcode);
+        println!(
+            "[DBG] RIP=0x{:X} PC={} OPCODE=0x{:02X}",
+            state.rip, pc, opcode
+        );
         // show a few registers (RAX,RBX,RSP,RBP if present)
-        for name in ["RAX","RBX","RCX","RDX","RSP","RBP"].iter() {
+        for name in ["RAX", "RBX", "RCX", "RDX", "RSP", "RBP"].iter() {
             if let Some(id) = RegisterMap::build_name_to_id().get(*name) {
                 let val = *state.regs.get(id).unwrap_or(&0);
                 print!("{}=0x{:X} ", name, val);
@@ -167,18 +182,35 @@ impl Debugger for TuiDebugger {
             Ok(ev) => {
                 if let crossterm::event::Event::Key(k) = ev {
                     match k.code {
-                        crossterm::event::KeyCode::Char('s') => { return DebuggerControl::Continue; }
-                        crossterm::event::KeyCode::Char('c') => { self.continue_mode.set(true); return DebuggerControl::Continue; }
-                        crossterm::event::KeyCode::Char('q') => { return DebuggerControl::Exit; }
-                        _ => { println!("[dbg] unrecognized key"); return DebuggerControl::Continue; }
+                        crossterm::event::KeyCode::Char('s') => {
+                            return DebuggerControl::Continue;
+                        }
+                        crossterm::event::KeyCode::Char('c') => {
+                            self.continue_mode.set(true);
+                            return DebuggerControl::Continue;
+                        }
+                        crossterm::event::KeyCode::Char('q') => {
+                            return DebuggerControl::Exit;
+                        }
+                        _ => {
+                            println!("[dbg] unrecognized key");
+                            return DebuggerControl::Continue;
+                        }
                     }
                 }
             }
             Err(_) => {
                 // fallback: read a line
-                let mut s = String::new(); let _ = std::io::stdin().read_line(&mut s);
-                let s = s.trim(); if s == "c" { self.continue_mode.set(true); return DebuggerControl::Continue; }
-                if s == "q" { return DebuggerControl::Exit; }
+                let mut s = String::new();
+                let _ = std::io::stdin().read_line(&mut s);
+                let s = s.trim();
+                if s == "c" {
+                    self.continue_mode.set(true);
+                    return DebuggerControl::Continue;
+                }
+                if s == "q" {
+                    return DebuggerControl::Exit;
+                }
                 return DebuggerControl::Continue;
             }
         }
@@ -1536,17 +1568,65 @@ pub fn run_masi_with_io(
                     }
                 }
                 // Extra debug: show raw m_mode/f_mode and values
-                debug_println!("[DEBUG-MNI-Raw] m_mode={} m_val=0x{:X} f_mode={} f_val=0x{:X}", m_mode, m_val, f_mode, f_val);
+                debug_println!(
+                    "[DEBUG-MNI-Raw] m_mode={} m_val=0x{:X} f_mode={} f_val=0x{:X}",
+                    m_mode,
+                    m_val,
+                    f_mode,
+                    f_val
+                );
                 if m_mode == 3 {
-                    if let Some(s) = read_c_string(m_val, &state) { debug_println!("[DEBUG-MNI-Raw] module-cstr='{}'", s); } else { debug_println!("[DEBUG-MNI-Raw] module-cstr=<invalid ptr 0x{:X}>", m_val); }
+                    if let Some(s) = read_c_string(m_val, &state) {
+                        debug_println!("[DEBUG-MNI-Raw] module-cstr='{}'", s);
+                    } else {
+                        debug_println!("[DEBUG-MNI-Raw] module-cstr=<invalid ptr 0x{:X}>", m_val);
+                    }
                 }
                 if f_mode == 3 {
-                    if let Some(s) = read_c_string(f_val, &state) { debug_println!("[DEBUG-MNI-Raw] function-cstr='{}'", s); } else { debug_println!("[DEBUG-MNI-Raw] function-cstr=<invalid ptr 0x{:X}>", f_val); }
+                    if let Some(s) = read_c_string(f_val, &state) {
+                        debug_println!("[DEBUG-MNI-Raw] function-cstr='{}'", s);
+                    } else {
+                        debug_println!("[DEBUG-MNI-Raw] function-cstr=<invalid ptr 0x{:X}>", f_val);
+                    }
                 }
                 // Decode module/function names
-                let mod_name = match m_mode { 3 => read_c_string(m_val, &state), 1 => Some(RegisterMap::build_id_to_name().remove(&(m_val as u16)).unwrap_or_else(|| format!("REG{}", m_val as u16))), 0 => Some(format!("{}", m_val)), 4 => Some(format!("${}", RegisterMap::build_id_to_name().remove(&(m_val as u16)).unwrap_or_else(|| format!("REG{}", m_val as u16)))), _ => None };
-                let fn_name  = match f_mode { 3 => read_c_string(f_val, &state), 1 => Some(RegisterMap::build_id_to_name().remove(&(f_val as u16)).unwrap_or_else(|| format!("REG{}", f_val as u16))), 0 => Some(format!("{}", f_val)), 4 => Some(format!("${}", RegisterMap::build_id_to_name().remove(&(f_val as u16)).unwrap_or_else(|| format!("REG{}", f_val as u16)))), _ => None };
-                debug_println!("[DEBUG] MNI lookup: module={:?}, function={:?}", &mod_name, &fn_name);
+                let mod_name = match m_mode {
+                    3 => read_c_string(m_val, &state),
+                    1 => Some(
+                        RegisterMap::build_id_to_name()
+                            .remove(&(m_val as u16))
+                            .unwrap_or_else(|| format!("REG{}", m_val as u16)),
+                    ),
+                    0 => Some(format!("{}", m_val)),
+                    4 => Some(format!(
+                        "${}",
+                        RegisterMap::build_id_to_name()
+                            .remove(&(m_val as u16))
+                            .unwrap_or_else(|| format!("REG{}", m_val as u16))
+                    )),
+                    _ => None,
+                };
+                let fn_name = match f_mode {
+                    3 => read_c_string(f_val, &state),
+                    1 => Some(
+                        RegisterMap::build_id_to_name()
+                            .remove(&(f_val as u16))
+                            .unwrap_or_else(|| format!("REG{}", f_val as u16)),
+                    ),
+                    0 => Some(format!("{}", f_val)),
+                    4 => Some(format!(
+                        "${}",
+                        RegisterMap::build_id_to_name()
+                            .remove(&(f_val as u16))
+                            .unwrap_or_else(|| format!("REG{}", f_val as u16))
+                    )),
+                    _ => None,
+                };
+                debug_println!(
+                    "[DEBUG] MNI lookup: module={:?}, function={:?}",
+                    &mod_name,
+                    &fn_name
+                );
                 debug_println!("[DEBUG] Registered MNI functions (omitted in normal run)");
                 if let (Some(mn), Some(fn_)) = (&mod_name, &fn_name) {
                     let mn_lc = mn.trim().to_lowercase();
@@ -1691,15 +1771,24 @@ pub fn run_masi_with_io(
                     // Debug: module/function decoding failed — show some memory & registers
                     let dbg_m = mod_name.clone();
                     let dbg_f = fn_name.clone();
-                    debug_println!("[DEBUG-MNI-FAIL] pc=0x{:X} mod_name={:?} fn_name={:?}", state.rip, dbg_m, dbg_f);
+                    debug_println!(
+                        "[DEBUG-MNI-FAIL] pc=0x{:X} mod_name={:?} fn_name={:?}",
+                        state.rip,
+                        dbg_m,
+                        dbg_f
+                    );
                     {
                         let mem = state.memory.lock().unwrap();
                         let len = std::cmp::min(128, mem.len());
-                        let hex = mem[0..len].iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+                        let hex = mem[0..len]
+                            .iter()
+                            .map(|b| format!("{:02X}", b))
+                            .collect::<Vec<_>>()
+                            .join(" ");
                         debug_println!("[DEBUG-MNI-FAIL] mem[0..{}]: {}", len, hex);
                     }
                     let idmap = RegisterMap::build_name_to_id();
-                    for rname in ["RAX","RBP","RSP","R1","R2","R3","R4"].iter() {
+                    for rname in ["RAX", "RBP", "RSP", "R1", "R2", "R3", "R4"].iter() {
                         if let Some(id) = idmap.get(*rname) {
                             let v = *state.regs.get(id).unwrap_or(&0);
                             debug_println!("[DEBUG-MNI-FAIL] {} = 0x{:X}", rname, v);

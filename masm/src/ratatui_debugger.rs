@@ -1,15 +1,15 @@
 #[cfg(feature = "ratatui_debug")]
 mod ratatui_impl {
     use super::*;
+    use crossterm::event::{self, Event, KeyCode, KeyEvent};
+    use ratatui::Terminal;
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::layout::{Constraint, Direction, Layout};
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Span, Spans};
+    use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
     use std::cell::Cell;
     use std::time::Duration;
-    use crossterm::event::{self, Event, KeyCode, KeyEvent};
-    use ratatui::backend::CrosstermBackend;
-    use ratatui::Terminal;
-    use ratatui::layout::{Constraint, Direction, Layout};
-    use ratatui::widgets::{Block, Borders, Paragraph, Wrap, List, ListItem};
-    use ratatui::text::{Span, Spans};
-    use ratatui::style::{Color, Modifier, Style};
 
     pub struct RatatuiDebuggerInner {
         continue_mode: Cell<bool>,
@@ -18,9 +18,22 @@ mod ratatui_impl {
     }
 
     impl RatatuiDebuggerInner {
-        pub fn new() -> Self { Self { continue_mode: Cell::new(false), memory_offset: Cell::new(0), focused_pane: Cell::new(2) } }
+        pub fn new() -> Self {
+            Self {
+                continue_mode: Cell::new(false),
+                memory_offset: Cell::new(0),
+                focused_pane: Cell::new(2),
+            }
+        }
 
-        fn draw_ui<B: ratatui::backend::Backend>(&self, terminal: &mut Terminal<B>, masi: &crate::disassembler::MASIFile, state: &crate::interpreter::State, pc: usize, opcode: u8) -> Result<(), std::io::Error> {
+        fn draw_ui<B: ratatui::backend::Backend>(
+            &self,
+            terminal: &mut Terminal<B>,
+            masi: &crate::disassembler::MASIFile,
+            state: &crate::interpreter::State,
+            pc: usize,
+            opcode: u8,
+        ) -> Result<(), std::io::Error> {
             let size = terminal.size()?;
             terminal.draw(|f| {
                 // paint a background so the whole terminal gets a uniform color
@@ -145,8 +158,16 @@ mod ratatui_impl {
     }
 
     impl crate::interpreter::Debugger for RatatuiDebuggerInner {
-        fn before_execute(&mut self, masi: &crate::disassembler::MASIFile, state: &crate::interpreter::State, pc: usize, opcode: u8) -> crate::interpreter::DebuggerControl {
-            if self.continue_mode.get() { return crate::interpreter::DebuggerControl::Continue; }
+        fn before_execute(
+            &mut self,
+            masi: &crate::disassembler::MASIFile,
+            state: &crate::interpreter::State,
+            pc: usize,
+            opcode: u8,
+        ) -> crate::interpreter::DebuggerControl {
+            if self.continue_mode.get() {
+                return crate::interpreter::DebuggerControl::Continue;
+            }
 
             // Setup terminal
             let mut stdout = std::io::stdout();
@@ -163,17 +184,38 @@ mod ratatui_impl {
                 if event::poll(Duration::from_millis(100)).unwrap_or(false) {
                     if let Ok(Event::Key(KeyEvent { code, .. })) = event::read() {
                         match code {
-                            KeyCode::Char('s') => { // step
+                            KeyCode::Char('s') => {
+                                // step
                                 let _ = terminal.clear();
                                 crossterm::terminal::disable_raw_mode().ok();
                                 return crate::interpreter::DebuggerControl::Continue;
                             }
-                            KeyCode::Char('c') => { self.continue_mode.set(true); let _ = terminal.clear(); crossterm::terminal::disable_raw_mode().ok(); return crate::interpreter::DebuggerControl::Continue; }
-                            KeyCode::Char('q') => { let _ = terminal.clear(); crossterm::terminal::disable_raw_mode().ok(); return crate::interpreter::DebuggerControl::Exit; }
-                            KeyCode::Char('d') => { let _ = self.draw_ui(&mut terminal, masi, state, pc, opcode); }
-                            KeyCode::Char('1') => { self.focused_pane.set(1); let _ = self.draw_ui(&mut terminal, masi, state, pc, opcode); }
-                            KeyCode::Char('2') => { self.focused_pane.set(2); let _ = self.draw_ui(&mut terminal, masi, state, pc, opcode); }
-                            KeyCode::Char('3') => { self.focused_pane.set(3); let _ = self.draw_ui(&mut terminal, masi, state, pc, opcode); }
+                            KeyCode::Char('c') => {
+                                self.continue_mode.set(true);
+                                let _ = terminal.clear();
+                                crossterm::terminal::disable_raw_mode().ok();
+                                return crate::interpreter::DebuggerControl::Continue;
+                            }
+                            KeyCode::Char('q') => {
+                                let _ = terminal.clear();
+                                crossterm::terminal::disable_raw_mode().ok();
+                                return crate::interpreter::DebuggerControl::Exit;
+                            }
+                            KeyCode::Char('d') => {
+                                let _ = self.draw_ui(&mut terminal, masi, state, pc, opcode);
+                            }
+                            KeyCode::Char('1') => {
+                                self.focused_pane.set(1);
+                                let _ = self.draw_ui(&mut terminal, masi, state, pc, opcode);
+                            }
+                            KeyCode::Char('2') => {
+                                self.focused_pane.set(2);
+                                let _ = self.draw_ui(&mut terminal, masi, state, pc, opcode);
+                            }
+                            KeyCode::Char('3') => {
+                                self.focused_pane.set(3);
+                                let _ = self.draw_ui(&mut terminal, masi, state, pc, opcode);
+                            }
                             // memory scrolling when memory pane focused
                             KeyCode::Char('8') | KeyCode::Up => {
                                 if self.focused_pane.get() == 2 {
@@ -208,7 +250,7 @@ mod ratatui_impl {
                             KeyCode::PageUp => {
                                 if self.focused_pane.get() == 2 {
                                     let offs = self.memory_offset.get();
-                                    let new = offs.saturating_sub(16*8);
+                                    let new = offs.saturating_sub(16 * 8);
                                     self.memory_offset.set(new);
                                     let _ = self.draw_ui(&mut terminal, masi, state, pc, opcode);
                                 }
@@ -216,7 +258,7 @@ mod ratatui_impl {
                             KeyCode::PageDown => {
                                 if self.focused_pane.get() == 2 {
                                     let offs = self.memory_offset.get();
-                                    self.memory_offset.set(offs + 16*8);
+                                    self.memory_offset.set(offs + 16 * 8);
                                     let _ = self.draw_ui(&mut terminal, masi, state, pc, opcode);
                                 }
                             }
@@ -234,9 +276,11 @@ pub use ratatui_impl::RatatuiDebuggerInner as RatatuiDebugger;
 
 // If feature not enabled, provide a stub to avoid compile errors when the module is referenced
 #[cfg(not(feature = "ratatui_debug"))]
-pub struct RatatuiDebugger { }
+pub struct RatatuiDebugger {}
 
 #[cfg(not(feature = "ratatui_debug"))]
-impl RatatuiDebugger { pub fn new() -> Self { Self { } } }
-
-
+impl RatatuiDebugger {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
