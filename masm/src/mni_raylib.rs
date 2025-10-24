@@ -23,6 +23,7 @@ struct RaylibGlobal {
     tex_w: i32,
     tex_h: i32,
     commands: Vec<DrawCommand>,
+    pixel_dirty: bool,
 }
 
 impl RaylibGlobal {
@@ -34,6 +35,7 @@ impl RaylibGlobal {
             tex_w: 0,
             tex_h: 0,
             commands: Vec::new(),
+            pixel_dirty: true,
         }
     }
 }
@@ -565,9 +567,12 @@ pub fn register_raylib_mni(reg: &mut ModuleRegistry) {
                     }
                 }
 
-                // Update texture with pixel data
-                if let Some(tex) = gl.texture.as_mut() {
-                    let _ = tex.update_texture(&pixels);
+                // Update texture with pixel data if needed
+                if recreate || gl.pixel_dirty {
+                    if let Some(tex) = gl.texture.as_mut() {
+                        let _ = tex.update_texture(&pixels);
+                    }
+                    gl.pixel_dirty = false;
                 }
 
                 // Execute frame: all commands + texture draw
@@ -699,6 +704,11 @@ pub fn register_raylib_mni(reg: &mut ModuleRegistry) {
             mem[idx + 1] = g;
             mem[idx + 2] = b;
             mem[idx + 3] = a;
+            RL_STATE.with(|cell| {
+                if let Some(gl) = cell.borrow_mut().as_mut() {
+                    gl.pixel_dirty = true;
+                }
+            });
         }
     });
 
@@ -743,5 +753,10 @@ pub fn register_raylib_mni(reg: &mut ModuleRegistry) {
                 mem[idx + 3] = a;
             }
         }
+        RL_STATE.with(|cell| {
+            if let Some(gl) = cell.borrow_mut().as_mut() {
+                gl.pixel_dirty = true;
+            }
+        });
     });
 }
