@@ -7,7 +7,7 @@ mod register_map;
 //#[cfg(feature = "raylib_mni")]
 //pub mod mni_raylib;
 
-use interpreter::{CliDebugger, set_thread_debugger};
+use interpreter::{CliDebugger, set_thread_debugger, set_debug_print};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ use ratatui_debugger::RatatuiDebugger;
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  masm <input.masm> [-o <out.masi>]\n  masm <input.masi> --disasm [-o <out.masm>]\n  masm <input.masi> --dump\n  masm <input.masi> --run [--stdin-from <file>]\n  masm <input.masi> --debug [--stdin-from <file>]\n  masm link <a.masi> <b.masi>... -o <out.masi>\n\nOptions:\n  -o <file>          Output file path (assemble: out.masi, disasm: stdout if omitted)\n  --dump             Dump MASI header/sections/labels\n  --disasm          Disassemble .masi to MASM text\n  --run             Execute a .masi file with the Rust interpreter\n  --debug, -g      Run with interactive debugger\n  --stdin-from <f> Read program input from file (for IN/syscall read), not the console\n  -h, --help       Show help\n"
+        "Usage:\n  masm <input.masm> [-o <out.masi>]\n  masm <input.masi> --disasm [-o <out.masm>]\n  masm <input.masi> --dump\n  masm <input.masi> --run [--stdin-from <file>]\n  masm <input.masi> --debug [--stdin-from <file>]\n  masm link <a.masi> <b.masi>... -o <out.masi>\n\nOptions:\n  -o <file>          Output file path (assemble: out.masi, disasm: stdout if omitted)\n  --dump             Dump MASI header/sections/labels\n  --disasm          Disassemble .masi to MASM text\n  --run             Execute a .masi file with the Rust interpreter\n  --debug, -g      Run with interactive debugger\n  --debug-mni       Enable MNI function execution time instrumentation\n  --stdin-from <f> Read program input from file (for IN/syscall read), not the console\n  -h, --help       Show help\n"
     );
 }
 
@@ -31,6 +31,7 @@ fn main() {
     let mut run_flag: bool = false;
     let mut link_mode: bool = false;
     let mut debug_mode: bool = false;
+    let mut debug_mni: bool = false;
     let mut stdin_from: Option<PathBuf> = None;
     let mut link_inputs: Vec<String> = Vec::new();
 
@@ -60,6 +61,9 @@ fn main() {
             "--debug" | "-g" => {
                 debug_mode = true;
                 run_flag = true;
+            }
+            "--debug-mni" => {
+                debug_mni = true;
             }
             "--stdin-from" => {
                 if let Some(p) = args.next() {
@@ -135,6 +139,10 @@ fn main() {
             }
         };
         if run_flag || (!disasm && !dump) {
+            // Enable MNI timing instrumentation if requested
+            if debug_mni {
+                set_debug_print(true);
+            }
             if debug_mode {
                 #[cfg(feature = "ratatui_debug")]
                 {
@@ -212,6 +220,10 @@ fn main() {
             Ok(bytes) => {
                 // If run or debug mode requested, run directly; otherwise save to file
                 if run_flag || debug_mode {
+                    // Enable MNI timing instrumentation if requested
+                    if debug_mni {
+                        set_debug_print(true);
+                    }
                     match disassembler::parse_masi_bytes(&bytes) {
                         Ok(masi) => {
                             if debug_mode {
