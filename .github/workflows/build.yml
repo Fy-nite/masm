@@ -16,12 +16,11 @@ jobs:
       
       - name: Build for Linux
         run: |
-          cargo build
+          cargo build --release
           
       - name: Build for Windows
         run: |
-          cargo build
-          
+          cargo build --target x86_64-pc-windows-msvc --release
       - uses: softprops/action-gh-release@v1
         with:
           files: |
