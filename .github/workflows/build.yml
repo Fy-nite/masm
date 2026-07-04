@@ -8,24 +8,36 @@ on:
 jobs:
   release:
     runs-on: ubuntu-latest
+
     permissions:
       contents: write
-    
+
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Build for Linux
+
+      - name: Install Rust targets
         run: |
-          cargo build --target x86_64-unknown-linux-gnu --release
-          
-      - name: Build for Windows
+          rustup target add x86_64-unknown-linux-gnu
+          rustup target add x86_64-pc-windows-gnu
+
+      - name: Install MinGW
         run: |
-          cargo build --target x86_64-pc-windows-gnu --release
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64
+
+      - name: Build Linux
+        run: |
+          cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Build Windows
+        run: |
+          cargo build --release --target x86_64-pc-windows-gnu
+
       - uses: softprops/action-gh-release@v1
         with:
           files: |
-            target/debug/masm
-            target/debug/masm.exe
+            target/x86_64-unknown-linux-gnu/release/masm
+            target/x86_64-pc-windows-gnu/release/masm.exe
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
