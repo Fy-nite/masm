@@ -4,7 +4,7 @@ lbl main
     
     ; init window
     MNI Raylib.init 400 300 TextTest
-    ;MNI Raylib.set_target_fps 60
+    MNI Raylib.set_target_fps 60
 ; initialize positions and velocities
     mov R10 0  ; X position
     mov R11 0  ; Y position
@@ -19,6 +19,10 @@ lbl loop
     ; present frame
     mov R1 0
     MNI Raylib.present R1 400 300
+    MNI Raylib.show_fps
+    out 1 RAX
+
+    
 
     ; exit on ESC (256)
     MNI Raylib.is_key_down 256

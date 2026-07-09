@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::fs;
+use std::time::Instant;
 use std::io::{self, BufRead, Write};
 use std::os::raw::{c_char, c_void};
 use std::path::Path;
@@ -1568,25 +1569,25 @@ pub fn run_masi_with_io(
                     }
                 }
                 // Extra debug: show raw m_mode/f_mode and values
-                debug_println!(
-                    "[DEBUG-MNI-Raw] m_mode={} m_val=0x{:X} f_mode={} f_val=0x{:X}",
-                    m_mode,
-                    m_val,
-                    f_mode,
-                    f_val
-                );
+                // debug_println!(
+                //     "[DEBUG-MNI-Raw] m_mode={} m_val=0x{:X} f_mode={} f_val=0x{:X}",
+                //     m_mode,
+                //     m_val,
+                //     f_mode,
+                //     f_val
+                // );
                 if m_mode == 3 {
                     if let Some(s) = read_c_string(m_val, &state) {
-                        debug_println!("[DEBUG-MNI-Raw] module-cstr='{}'", s);
+                        // debug_println!("[DEBUG-MNI-Raw] module-cstr='{}'", s);
                     } else {
-                        debug_println!("[DEBUG-MNI-Raw] module-cstr=<invalid ptr 0x{:X}>", m_val);
+                        // debug_println!("[DEBUG-MNI-Raw] module-cstr=<invalid ptr 0x{:X}>", m_val);
                     }
                 }
                 if f_mode == 3 {
                     if let Some(s) = read_c_string(f_val, &state) {
-                        debug_println!("[DEBUG-MNI-Raw] function-cstr='{}'", s);
+                        // debug_println!("[DEBUG-MNI-Raw] function-cstr='{}'", s);
                     } else {
-                        debug_println!("[DEBUG-MNI-Raw] function-cstr=<invalid ptr 0x{:X}>", f_val);
+                        // debug_println!("[DEBUG-MNI-Raw] function-cstr=<invalid ptr 0x{:X}>", f_val);
                     }
                 }
                 // Decode module/function names
@@ -1622,12 +1623,12 @@ pub fn run_masi_with_io(
                     )),
                     _ => None,
                 };
-                debug_println!(
-                    "[DEBUG] MNI lookup: module={:?}, function={:?}",
-                    &mod_name,
-                    &fn_name
-                );
-                debug_println!("[DEBUG] Registered MNI functions (omitted in normal run)");
+                // debug_println!(
+                //     "[DEBUG] MNI lookup: module={:?}, function={:?}",
+                //     &mod_name,
+                //     &fn_name
+                // );
+                // debug_println!("[DEBUG] Registered MNI functions (omitted in normal run)");
                 if let (Some(mn), Some(fn_)) = (&mod_name, &fn_name) {
                     let mn_lc = mn.trim().to_lowercase();
                     let fn_lc = fn_.trim().to_lowercase();
@@ -1636,14 +1637,23 @@ pub fn run_masi_with_io(
                             state: state.clone(),
                             args: argv,
                         };
+                        // Instrumentation: measure MNI function wall-clock time and print when debug enabled
+                        let mni_start = Instant::now();
                         func(&mut ctx);
+                        let mni_dur = mni_start.elapsed();
                         state = ctx.state;
                         let rax_id = RegisterMap::build_name_to_id()
                             .get("RAX")
                             .copied()
                             .unwrap_or(0);
                         let rax_val = state.regs.get(&rax_id).copied().unwrap_or(0);
-                        debug_println!("[DEBUG] RAX after MNI: {}", rax_val);
+                        debug_println!(
+                            "[MNI-TIME] {}.{} took {:.6} ms (RAX=0x{:X})",
+                            mn.trim(),
+                            fn_.trim(),
+                            mni_dur.as_secs_f64() * 1000.0,
+                            rax_val
+                        );
                     } else {
                         // Try dynamic library loading via libloading
                         let module_raw = mn.trim();
@@ -1707,6 +1717,8 @@ pub fn run_masi_with_io(
                                         get_reg_by_name: host_get_reg_by_name,
                                         set_reg_by_name: host_set_reg_by_name,
                                     };
+                                    // Start timing dynamic MNI resolution+call (printed only when debug enabled)
+                                    let dyn_start = Instant::now();
                                     for cname in candidates.iter() {
                                         // Prefer ctx variant first ("name_ctx")
                                         let ctx_variants =
@@ -1745,6 +1757,14 @@ pub fn run_masi_with_io(
                                             .copied()
                                             .unwrap_or(0);
                                         state.regs.insert(rax_id, val as u64);
+                                        let dyn_dur = dyn_start.elapsed();
+                                        debug_println!(
+                                            "[MNI-TIME] dynamic {}.{} took {:.6} ms (RAX=0x{:X})",
+                                            module_raw,
+                                            func_raw,
+                                            dyn_dur.as_secs_f64() * 1000.0,
+                                            val as u64
+                                        );
                                         // sync memory pointer/len in case C mutated memory via ctx
                                         // (state already updated by host_write_u64 when called)
                                     } else {
@@ -1771,12 +1791,12 @@ pub fn run_masi_with_io(
                     // Debug: module/function decoding failed — show some memory & registers
                     let dbg_m = mod_name.clone();
                     let dbg_f = fn_name.clone();
-                    debug_println!(
-                        "[DEBUG-MNI-FAIL] pc=0x{:X} mod_name={:?} fn_name={:?}",
-                        state.rip,
-                        dbg_m,
-                        dbg_f
-                    );
+                    // debug_println!(
+                    //     "[DEBUG-MNI-FAIL] pc=0x{:X} mod_name={:?} fn_name={:?}",
+                    //     state.rip,
+                    //     dbg_m,
+                    //     dbg_f
+                    // );
                     {
                         let mem = state.memory.lock().unwrap();
                         let len = std::cmp::min(128, mem.len());
@@ -1785,13 +1805,13 @@ pub fn run_masi_with_io(
                             .map(|b| format!("{:02X}", b))
                             .collect::<Vec<_>>()
                             .join(" ");
-                        debug_println!("[DEBUG-MNI-FAIL] mem[0..{}]: {}", len, hex);
+                        // debug_println!("[DEBUG-MNI-FAIL] mem[0..{}]: {}", len, hex);
                     }
                     let idmap = RegisterMap::build_name_to_id();
                     for rname in ["RAX", "RBP", "RSP", "R1", "R2", "R3", "R4"].iter() {
                         if let Some(id) = idmap.get(*rname) {
                             let v = *state.regs.get(id).unwrap_or(&0);
-                            debug_println!("[DEBUG-MNI-FAIL] {} = 0x{:X}", rname, v);
+                            // debug_println!("[DEBUG-MNI-FAIL] {} = 0x{:X}", rname, v);
                         }
                     }
                     let msg = "MNI: module or function decoding failed".to_string();
